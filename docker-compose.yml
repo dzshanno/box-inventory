@@ -1,0 +1,26 @@
+# Homebox plus Box Inventory. Copy .env.example to .env and fill it in first.
+# Already running Homebox? Delete the "homebox" service below and point
+# HOMEBOX_URL in .env at your existing instance.
+services:
+  homebox:
+    image: ghcr.io/sysadminsmedia/homebox:0.27
+    restart: unless-stopped
+    environment:
+      - HBOX_LOG_LEVEL=info
+      - HBOX_LOG_FORMAT=text
+      - HBOX_WEB_MAX_UPLOAD_SIZE=20
+      - HBOX_OPTIONS_ALLOW_ANALYTICS=false
+      - HBOX_AUTH_API_KEY_PEPPER=${HBOX_AUTH_API_KEY_PEPPER:?set HBOX_AUTH_API_KEY_PEPPER in .env}
+    volumes:
+      - ./homebox-data:/data
+    ports:
+      - "3100:7745"
+
+  box-inventory:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - homebox
+    ports:
+      - "8080:8080"

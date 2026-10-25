@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2f6f4f">
+  <title>Box Inventory</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232f6f4f' d='M3 7l9-4 9 4v10l-9 4-9-4z'/%3E%3C/svg%3E">
+</head>
+<body>
+<header>
+  <h1>Box Inventory</h1>
+  <span id="boxBadge" class="badge" hidden></span>
+</header>
+
+<main>
+  <!-- 1. Pick a box -->
+  <section id="stepBox" class="step">
+    <label for="boxNumber" class="big-label">Box number</label>
+    <input id="boxNumber" class="box-number" inputmode="numeric" autocomplete="off" placeholder="42">
+    <p id="boxHint" class="hint"></p>
+    <button id="startBtn" class="primary">Start</button>
+  </section>
+
+  <!-- 2. Photos and description -->
+  <section id="stepCapture" class="step" hidden>
+    <div id="existingNote" class="note" hidden></div>
+
+    <h2>Photos</h2>
+    <p class="hint">The label, then the open box from above. Lay things out for more detail.</p>
+    <div id="photoGrid" class="photo-grid"></div>
+    <label class="secondary file-btn">
+      <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
+      Take photo
+    </label>
+    <label class="link-btn file-btn">
+      <input id="photoPick" type="file" accept="image/*" multiple hidden>
+      or choose from gallery
+    </label>
+
+    <h2>Describe what's inside</h2>
+    <button id="micBtn" class="mic" type="button" aria-pressed="false">
+      <span class="dot"></span><span id="micLabel">Tap to talk</span>
+    </button>
+    <p id="micHint" class="hint"></p>
+    <p id="interim" class="interim"></p>
+    <textarea id="transcript" rows="6" placeholder="Your description appears here. You can also type or edit it."></textarea>
+
+    <div class="row">
+      <button id="backToBox" class="secondary" type="button">Back</button>
+      <button id="analyseBtn" class="primary" type="button">Make inventory</button>
+    </div>
+  </section>
+
+  <!-- 3. Review -->
+  <section id="stepReview" class="step" hidden>
+    <h2 id="reviewTitle">Check the list</h2>
+    <p id="summary" class="summary"></p>
+    <div id="questions" class="questions" hidden></div>
+    <div id="items"></div>
+    <button id="addItem" class="secondary" type="button">+ Add item</button>
+    <div class="row sticky">
+      <button id="backToCapture" class="secondary" type="button">Back</button>
+      <button id="saveBtn" class="primary" type="button">Save to Homebox</button>
+    </div>
+  </section>
+
+  <!-- 4. Done -->
+  <section id="stepDone" class="step" hidden>
+    <div class="done-icon">✓</div>
+    <h2 id="doneTitle">Saved</h2>
+    <p id="doneText"></p>
+    <p><a id="doneLink" target="_blank" rel="noopener" hidden>Open in Homebox</a></p>
+    <button id="nextBox" class="primary" type="button">Next box</button>
+    <button id="sameBox" class="secondary" type="button">Add more to this box</button>
+  </section>
+</main>
+
+<div id="busy" class="busy" hidden><div class="spinner"></div><p id="busyText">Working…</p></div>
+<div id="toast" class="toast" hidden></div>
+
+<template id="itemTpl">
+  <div class="item">
+    <div class="item-top">
+      <input class="name" placeholder="Item name" aria-label="Item name">
+      <input class="qty" type="number" min="1" inputmode="numeric" aria-label="Quantity">
+      <button class="remove" type="button" aria-label="Remove item">✕</button>
+    </div>
+    <textarea class="desc" rows="2" placeholder="Details (colour, brand, condition…)" aria-label="Details"></textarea>
+    <input class="tags" placeholder="Tags, comma separated" aria-label="Tags">
+    <div class="meta"></div>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
