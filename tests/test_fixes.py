@@ -4,9 +4,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from app.config import Settings, _colours
 from app.homebox import Homebox
 from app.main import create_app
 
@@ -22,15 +23,56 @@ def client_for(handler):
 
 
 def test_box_name_ignores_extra_leading_zeros():
-    s = replace(Settings(), box_name_format="Box {n}", box_number_digits=3)
-    assert s.box_name("42") == s.box_name("042") == s.box_name("0042") == "Box 042"
-    assert s.box_name("1234") == "Box 1234"
-    assert s.box_name("A1") == "Box A1"
+    s = replace(Settings(), box_number_digits=3)
+    assert s.box_name("42", "Red") == s.box_name("042", "red") == s.box_name("0042", " RED ") == "Box Red 042"
+    assert s.box_name("1234", "Blue") == "Box Blue 1234"
+    assert s.box_name("A1", "Blue") == "Box Blue A1"
+
+
+def test_colour_is_part_of_the_box():
+    s = Settings()
+    assert s.box_name("42", "Red") != s.box_name("42", "Blue")
+    with pytest.raises(ValueError, match="Pick a label colour"):
+        s.box_name("42")
+    with pytest.raises(ValueError, match="Unknown label colour 'Green'"):
+        s.box_name("42", "Green")
+
+
+def test_colours_setting():
+    s = replace(Settings(), box_colours=_colours("Red, Blue, Green=#2e7d32,"))
+    assert s.box_colours == (("Red", "red"), ("Blue", "blue"), ("Green", "#2e7d32"))
+    assert s.box_name("1", "green") == "Box Green 001"
+
+
+def test_no_colours_configured():
+    s = replace(Settings(), box_colours=())
+    assert s.box_name("42") == s.box_name("42", "anything") == "Box 042"
+    s = replace(Settings(), box_colours=(), box_name_format="Box {n}")
+    assert s.box_name("42") == "Box 042"
+
+
+def test_name_format_must_include_colour_when_several():
+    with pytest.raises(ValueError, match="must include {colour}"):
+        replace(Settings(), box_name_format="Box {n}")
+    assert replace(Settings(), box_colours=(("Red", "red"),), box_name_format="Box {n}").box_name("4", "Red") == "Box 004"
+
+
+def test_unknown_colour_rejected_by_api():
+    with client_for(unreachable) as client:
+        r = client.get("/api/box/1?colour=green")
+        assert r.status_code == 400 and "Unknown label colour" in r.json()["detail"]
+        r = client.get("/api/box/1")
+        assert r.status_code == 400 and "Pick a label colour" in r.json()["detail"]
+        r = client.post("/api/save", data={"box_number": "1", "items": "[]"})
+        assert r.status_code == 400
+        cfg = client.get("/api/config").json()
+        assert cfg["colours"] == [{"name": "Red", "css": "red"}, {"name": "Blue", "css": "blue"}]
+        assert cfg["exampleBoxName"] == "Box Red 001"
 
 
 def test_homebox_unreachable_gives_clear_error():
     with client_for(unreachable) as client:
-        r = client.get("/api/box/1")
+        r = client.get("/api/box/1?colour=Red")
     assert r.status_code == 502
     assert "Couldn't reach Homebox at http://hb.invalid" in r.json()["detail"]
 
@@ -39,7 +81,7 @@ def test_homebox_unreachable_on_login():
     hb_settings = replace(Settings(), homebox_url="http://hb.invalid", homebox_api_key="")
     hb = Homebox("http://hb.invalid", username="u", password="p", transport=httpx.MockTransport(unreachable))
     with TestClient(create_app(hb_settings, homebox=hb, claude=SimpleNamespace())) as client:
-        r = client.get("/api/box/1")
+        r = client.get("/api/box/1?colour=Blue")
     assert r.status_code == 502
     assert "Couldn't reach Homebox" in r.json()["detail"]
 
@@ -47,6 +89,6 @@ def test_homebox_unreachable_on_login():
 def test_save_rejects_items_that_are_not_objects():
     with client_for(unreachable) as client:
         for bad in ('["boots"]', '[1, 2]', '[{"name": "ok"}, null]', '{}', 'nope'):
-            r = client.post("/api/save", data={"box_number": "1", "items": bad})
+            r = client.post("/api/save", data={"box_number": "1", "colour": "Red", "items": bad})
             assert r.status_code == 400, bad
             assert "JSON list" in r.json()["detail"]

@@ -3,6 +3,7 @@
 const $ = (id) => document.getElementById(id);
 const state = {
   box: null,        // box number as typed
+  colour: "",       // label colour ("" when the app isn't set up with colours)
   boxInfo: null,    // response from /api/box
   photos: [],       // [{blob, url}]
   draft: null,      // response from /api/analyze
@@ -30,7 +31,7 @@ async function api(path, opts = {}) {
 function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ } }
 function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
 function forget(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
-const draftKey = () => `box-draft-${state.box}`;
+const draftKey = () => `box-draft-${state.colour ? state.colour + "-" : ""}${state.box}`;
 function saveDraft() {
   store(draftKey(), { transcript: $("transcript").value, items: state.draft ? collectItems() : null,
                       summary: state.draft?.box_summary || "" });
@@ -38,16 +39,36 @@ function saveDraft() {
 function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
 // ---------- step 1: box ----------
+function renderColours() {
+  const colours = window.APP_CONFIG?.colours || [];
+  $("colourField").hidden = !colours.length;
+  const pick = $("colourPick");
+  pick.innerHTML = "";
+  for (const c of colours) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "colour-chip";
+    b.setAttribute("role", "radio");
+    b.setAttribute("aria-checked", String(c.name === state.colour));
+    b.innerHTML = `<span class="swatch"></span><span></span>`;
+    b.querySelector(".swatch").style.background = c.css;
+    b.lastChild.textContent = c.name;
+    b.onclick = () => { state.colour = c.name; store("last-colour", c.name); renderColours(); };
+    pick.appendChild(b);
+  }
+}
+function boxQuery() { return state.colour ? `?colour=${encodeURIComponent(state.colour)}` : ""; }
 async function startBox(number) {
   number = String(number || "").trim();
+  if ((window.APP_CONFIG?.colours || []).length && !state.colour) { toast("Pick the label colour first."); return; }
   if (!number) { toast("Enter the box number first."); return; }
   busy("Checking Homebox…");
   try {
     state.box = number;
-    state.boxInfo = await api(`/api/box/${encodeURIComponent(number)}`);
+    state.boxInfo = await api(`/api/box/${encodeURIComponent(number)}${boxQuery()}`);
   } catch (e) { busy(); toast(e.message); return; }
   busy();
-  store("last-box", number);
+  store("last-box", { number, colour: state.colour });
   $("boxBadge").textContent = state.boxInfo.boxName;
   $("boxBadge").hidden = false;
 
@@ -176,6 +197,7 @@ async function analyse() {
   if (!state.photos.length && !transcript) { toast("Add a photo or describe what's in the box."); return; }
   const fd = new FormData();
   fd.append("box_number", state.box);
+  fd.append("colour", state.colour);
   fd.append("transcript", transcript);
   state.photos.forEach((p, i) => fd.append("photos", p.blob, `photo-${i + 1}.jpg`));
   busy("Claude is building the inventory… (usually under a minute)");
@@ -232,6 +254,7 @@ async function save() {
   if (!items.length && !state.photos.length) { toast("Nothing to save yet."); return; }
   const fd = new FormData();
   fd.append("box_number", state.box);
+  fd.append("colour", state.colour);
   fd.append("items", JSON.stringify(items));
   fd.append("transcript", $("transcript").value.trim());
   fd.append("box_summary", state.draft?.box_summary || "");
@@ -269,10 +292,15 @@ $("sameBox").onclick = () => startBox(state.box);
 
 (async function init() {
   setupMic();
-  const last = load("last-box");
-  if (last) $("boxHint").textContent = `Last box: ${last}`;
+  let last = load("last-box");
+  if (typeof last === "string") last = { number: last, colour: "" }; // saved by an older version
+  if (last) $("boxHint").textContent = `Last box: ${[last.colour, last.number].filter(Boolean).join(" ")}`;
   try {
     window.APP_CONFIG = await api("/api/config");
+    const names = (window.APP_CONFIG.colours || []).map((c) => c.name);
+    const remembered = load("last-colour");
+    state.colour = names.includes(remembered) ? remembered : (names.length === 1 ? names[0] : "");
+    renderColours();
     if (window.APP_CONFIG.parentLocation) {
       $("boxHint").textContent += `${last ? " · " : ""}Boxes are saved in “${window.APP_CONFIG.parentLocation}”.`;
     }

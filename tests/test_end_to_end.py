@@ -68,12 +68,13 @@ def test_full_flow(setup):
     client, claude, settings = setup
 
     # A new box doesn't exist yet
-    r = client.get("/api/box/7")
+    r = client.get("/api/box/7?colour=red")
     assert r.status_code == 200
-    assert r.json() == {"boxName": "Box 007", "exists": False, "items": [], "photoCount": 0}
+    assert r.json() == {"boxName": "Box Red 007", "exists": False, "items": [], "photoCount": 0}
 
     # Analyse: photos are shrunk for Claude, transcript passed through
-    r = client.post("/api/analyze", data={"box_number": "7", "transcript": "two pairs of boots and some scarves"},
+    r = client.post("/api/analyze", data={"box_number": "7", "colour": "Red",
+                                           "transcript": "two pairs of boots and some scarves"},
                     files=[("photos", ("a.jpg", jpeg(), "image/jpeg"))])
     assert r.status_code == 200, r.text
     draft = r.json()
@@ -88,7 +89,7 @@ def test_full_flow(setup):
     # Save (user edited one item)
     items = draft["items"]
     items[1]["quantity"] = 5
-    r = client.post("/api/save", data={"box_number": "7", "items": json.dumps(items),
+    r = client.post("/api/save", data={"box_number": "7", "colour": "Red", "items": json.dumps(items),
                                         "transcript": "two pairs of boots and some scarves",
                                         "box_summary": draft["box_summary"]},
                     files=[("photos", ("a.jpg", jpeg(), "image/jpeg"))])
@@ -98,7 +99,7 @@ def test_full_flow(setup):
     assert res["link"] == f"http://hb.example/location/{res['boxId']}"
 
     # Box now exists with the items, photo and notes
-    box = client.get("/api/box/007").json()
+    box = client.get("/api/box/007?colour=Red").json()
     assert box["exists"] and box["photoCount"] == 1
     got = {i["name"]: i for i in box["items"]}
     assert got["Scarves"]["quantity"] == 5
@@ -109,16 +110,24 @@ def test_full_flow(setup):
     # Coming back later: Claude is told what's already there, and new things are added
     claude.items = [{"name": "Gloves", "quantity": 3, "description": "", "tags": ["Clothing"],
                      "source": "spoken", "confidence": "high"}]
-    r = client.post("/api/analyze", data={"box_number": "7", "transcript": "also gloves"})
+    r = client.post("/api/analyze", data={"box_number": "7", "colour": "Red", "transcript": "also gloves"})
     assert r.status_code == 200
     assert "Already recorded in this box" in claude.calls[-1]["messages"][0]["content"][-1]["text"]
     assert "Winter boots x2" in claude.calls[-1]["messages"][0]["content"][-1]["text"]
-    r = client.post("/api/save", data={"box_number": "7", "items": json.dumps(r.json()["items"]),
+    r = client.post("/api/save", data={"box_number": "7", "colour": "Red", "items": json.dumps(r.json()["items"]),
                                         "transcript": "also gloves"})
     assert r.json()["created"] is False
-    box = client.get("/api/box/7").json()
+    box = client.get("/api/box/7?colour=Red").json()
     assert len(box["items"]) == 3
     assert box["notes"].count("Spoken description") == 2
+
+    # Blue 007 is a different box: still empty, and saving to it leaves Red 007 alone
+    assert client.get("/api/box/7?colour=Blue").json()["exists"] is False
+    r = client.post("/api/save", data={"box_number": "7", "colour": "Blue",
+                                        "items": json.dumps([{"name": "Paint tins", "quantity": 3}])})
+    assert r.json()["created"] is True and r.json()["boxName"] == "Box Blue 007"
+    assert [i["name"] for i in client.get("/api/box/7?colour=Blue").json()["items"]] == ["Paint tins"]
+    assert len(client.get("/api/box/7?colour=Red").json()["items"]) == 3
 
 
 def test_password_gate(setup):
@@ -133,6 +142,6 @@ def test_password_gate(setup):
 
 def test_needs_photo_or_description(setup):
     client, _, _ = setup
-    r = client.post("/api/analyze", data={"box_number": "8", "transcript": "  "})
+    r = client.post("/api/analyze", data={"box_number": "8", "colour": "Blue", "transcript": "  "})
     assert r.status_code == 422
     assert "photo or a description" in r.json()["detail"]

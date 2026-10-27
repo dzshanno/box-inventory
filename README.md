@@ -2,13 +2,13 @@
 
 Inventory a storage box from your phone in about a minute:
 
-1. Type the box number.
+1. Pick the label colour and type the box number.
 2. Photograph the label and the open box.
 3. Tap the mic and say what's inside.
 4. Claude turns the photos and your description into an item list.
 5. Fix anything that's wrong, then tap **Save to Homebox**.
 
-In Homebox, each box becomes a location (for example `Storage Unit › Box 042`). Everything in it becomes an item inside that location, with tags and quantities. The photos are attached to the box, and your spoken description is kept in the box's notes. A search for "boots" in Homebox then tells you which box to fetch.
+In Homebox, each box becomes a location (for example `Storage Unit › Box Red 042`). The label colour is part of the box's identity, so red 042 and blue 042 are two different boxes. Everything in it becomes an item inside that location, with tags and quantities. The photos are attached to the box, and your spoken description is kept in the box's notes. A search for "boots" in Homebox then tells you which box to fetch.
 
 Opening a box that already exists shows what's recorded. Claude is told about those items and only suggests new ones, so you can add to a box later.
 
@@ -71,8 +71,9 @@ All settings go in `.env`. See `.env.example` for the full list. The main ones:
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `PARENT_LOCATION` | `Storage Unit` | Homebox location the boxes go in. Created if missing. Empty puts boxes at the top level. |
-| `BOX_NAME_FORMAT` | `Box {n}` | How a box number becomes a name. |
-| `BOX_NUMBER_DIGITS` | `3` | Zero-padding for numbers: `42` becomes `Box 042`. |
+| `BOX_COLOURS` | `Red, Blue` | Label colours you use. Add a screen colour with `Green=#2e7d32`. Empty turns colours off. |
+| `BOX_NAME_FORMAT` | `Box {colour} {n}` | How a box becomes a name. Must include `{colour}` if you have more than one colour. |
+| `BOX_NUMBER_DIGITS` | `3` | Zero-padding for numbers: red `42` becomes `Box Red 042`. |
 | `SAVE_TRANSCRIPT` | `true` | Store your spoken description in the box's notes. |
 | `HOMEBOX_PUBLIC_URL` | (empty) | Adds an "Open in Homebox" link after saving. |
 | `CLAUDE_EFFORT` | `medium` | `low`, `medium` or `high`. |

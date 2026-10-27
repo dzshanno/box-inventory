@@ -79,6 +79,12 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         loc = await hb(request).find_location(settings.parent_location, None)
         return loc["id"] if loc else ""  # "" = parent doesn't exist yet, so no box can either
 
+    def box_name(number: str, colour: str) -> str:
+        try:
+            return settings.box_name(number, colour)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     def box_link(box_id: str) -> str | None:
         return f"{settings.homebox_public_url}/location/{box_id}" if settings.homebox_public_url else None
 
@@ -118,13 +124,14 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
     async def config():
         return {
             "parentLocation": settings.parent_location,
-            "exampleBoxName": settings.box_name("1"),
+            "colours": [{"name": n, "css": css} for n, css in settings.box_colours],
+            "exampleBoxName": settings.box_name("1", settings.box_colours[0][0] if settings.box_colours else ""),
             "maxPhotos": MAX_PHOTOS,
         }
 
     @app.get("/api/box/{number}")
-    async def get_box(number: str, request: Request):
-        name = settings.box_name(number)
+    async def get_box(number: str, request: Request, colour: str = ""):
+        name = box_name(number, colour)
         pid = await parent_id(request, create=False)
         box = None if pid == "" else await hb(request).find_location(name, pid)
         if not box:
@@ -138,9 +145,9 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         }
 
     @app.post("/api/analyze")
-    async def analyze(request: Request, box_number: str = Form(...), transcript: str = Form(""),
-                      photos: list[UploadFile] = File(default=[])):
-        name = settings.box_name(box_number)
+    async def analyze(request: Request, box_number: str = Form(...), colour: str = Form(""),
+                      transcript: str = Form(""), photos: list[UploadFile] = File(default=[])):
+        name = box_name(box_number, colour)
         pics = await read_photos(photos)
         tags = [t["name"] for t in await hb(request).list_tags()]
         pid = await parent_id(request, create=False)
@@ -154,7 +161,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         return draft
 
     @app.post("/api/save")
-    async def save(request: Request, box_number: str = Form(...), items: str = Form("[]"),
+    async def save(request: Request, box_number: str = Form(...), colour: str = Form(""), items: str = Form("[]"),
                    transcript: str = Form(""), box_summary: str = Form(""),
                    photos: list[UploadFile] = File(default=[])):
         try:
@@ -162,11 +169,11 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             assert isinstance(item_list, list) and all(isinstance(i, dict) for i in item_list)
         except Exception:
             raise HTTPException(400, "items must be a JSON list of objects")
+        name = box_name(box_number, colour)
         item_list = [i for i in item_list if str(i.get("name", "")).strip()]
         pics = await read_photos(photos)
         client = hb(request)
 
-        name = settings.box_name(box_number)
         pid = await parent_id(request, create=True)
         box, created = await client.ensure_location(name, pid)
         box_id = box["id"]

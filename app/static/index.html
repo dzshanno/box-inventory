@@ -17,6 +17,10 @@
 <main>
   <!-- 1. Pick a box -->
   <section id="stepBox" class="step">
+    <div id="colourField" hidden>
+      <p class="big-label" id="colourLabel">Label colour</p>
+      <div id="colourPick" class="colours" role="radiogroup" aria-labelledby="colourLabel"></div>
+    </div>
     <label for="boxNumber" class="big-label">Box number</label>
     <input id="boxNumber" class="box-number" inputmode="numeric" autocomplete="off" placeholder="42">
     <p id="boxHint" class="hint"></p>
