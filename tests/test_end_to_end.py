@@ -64,8 +64,8 @@ def jpeg():
 
 @pytest.fixture
 def setup():
-    parent = f"Test Unit {uuid.uuid4().hex[:6]}"
-    settings = replace(Settings(), homebox_url=URL, homebox_api_key=KEY, parent_location=parent,
+    root = f"Test Home {uuid.uuid4().hex[:6]}"  # keeps each test's places and boxes apart
+    settings = replace(Settings(), homebox_url=URL, homebox_api_key=KEY, storage_root=root,
                        homebox_public_url="http://hb.example")
     claude = FakeClaude([
         {"name": "Winter boots", "quantity": 2, "description": "Black leather", "tags": ["Clothing", "Shoes"],
@@ -341,3 +341,64 @@ def test_claude_search(setup):
     client.post("/api/save", data={"box_number": "47", "colour": "Red", "items": '[{"name": "Snorkel"}]'})
     assert client.get("/api/search", params={"q": "snorkel"}).json()["results"][0]["boxName"] == "Box Red 047"
     assert client.get("/api/search/claude", params={"q": " "}).status_code == 400
+
+
+def test_places_and_last_seen(setup, monkeypatch):
+    client, claude, _ = setup
+    import app.main
+
+    async def fake_areas(url, token):
+        return ["Dressing Room", "Under the stairs", "Workshop"]
+    monkeypatch.setattr(app.main, "area_names", fake_areas)
+
+    # Nothing yet; Home Assistant areas are offered
+    r = client.get("/api/places").json()
+    assert r["places"] == [] and r["suggestions"] == ["Dressing Room", "Under the stairs", "Workshop"]
+
+    workshop = client.post("/api/places", data={"name": " workshop "}).json()
+    assert workshop["name"] == "workshop"
+    assert client.post("/api/places", data={"name": "Workshop"}).json()["id"] == workshop["id"]  # no duplicates
+    lockup = client.post("/api/places", data={"name": "Lockup"}).json()
+    assert client.post("/api/places", data={"name": "Box Red 9"}).status_code == 400
+    r = client.get("/api/places").json()
+    assert [p["name"] for p in r["places"]] == ["Lockup", "workshop"]
+    assert r["suggestions"] == ["Dressing Room", "Under the stairs"]  # Workshop is already a place
+
+    # A new box goes where you say, and is seen there
+    photo = [("photos", ("a.jpg", jpeg(), "image/jpeg"))]
+    r = client.post("/api/save", data={"box_number": "32", "colour": "Red", "location_id": workshop["id"],
+                                        "items": '[{"name": "Baubles"}]'}, files=photo).json()
+    assert r["created"] and r["place"] == "workshop" and r["movedFrom"] is None
+    box = client.get("/api/box/32?colour=Red").json()
+    assert box["place"]["name"] == "workshop"
+    assert box["lastSeen"]["place"] == "workshop" and box["lastSeen"]["how"] == "photographed"
+    assert len(box["lastSeen"]["at"]) == 16  # "2026-10-27 13:20"
+
+    # Labels are unique everywhere: adding to Red 32 from the lockup moves it there
+    r = client.post("/api/save", data={"box_number": "32", "colour": "Red", "location_id": lockup["id"],
+                                        "items": '[{"name": "Tinsel"}]'}).json()
+    assert r["created"] is False and r["movedFrom"] == "workshop" and r["place"] == "Lockup"
+    box = client.get("/api/box/32?colour=Red").json()
+    assert box["place"]["name"] == "Lockup" and len(box["items"]) == 2
+    assert "Moved from workshop" in box["notes"] and box["lastSeen"]["how"] == "updated"
+
+    # Moving from the box page
+    r = client.post(f"/api/box-by-id/{box['id']}/move", data={"location_id": workshop["id"]}).json()
+    assert r["place"]["name"] == "workshop" and r["lastSeen"]["how"] == "moved here"
+    assert client.post(f"/api/box-by-id/{box['id']}/move", data={"location_id": "nope"}).status_code == 400
+
+    # No place given: the default place
+    r = client.post("/api/save", data={"box_number": "5", "colour": "Blue", "items": "[]"}).json()
+    assert r["place"] == "Storage Unit"
+
+    # Searches show where each box is and when it was last seen; place names are searchable
+    g = client.get("/api/search", params={"q": "baubles"}).json()["results"][0]
+    assert g["boxName"] == "Box Red 032" and g["place"] == "workshop" and g["lastSeen"]["how"] == "moved here"
+    assert [g["boxName"] for g in client.get("/api/search", params={"q": "workshop"}).json()["results"]] == ["Box Red 032"]
+
+    # Spotting a box in a photo records the spot
+    claude.locate = {"boxes": [{"target": "red 32", "found": True, "x1": 10, "y1": 10, "x2": 200, "y2": 200,
+                                "where": "top shelf, left", "confidence": "high"}], "seen": []}
+    client.post("/api/locate", data={"box_ids": box["id"]}, files=[("photo", ("r.jpg", jpeg(), "image/jpeg"))])
+    seen = client.get(f"/api/box-by-id/{box['id']}").json()["lastSeen"]
+    assert seen["how"] == "spotted in a photo" and seen["spot"] == "top shelf, left" and seen["place"] == "workshop"

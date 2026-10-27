@@ -9,6 +9,8 @@ const state = {
   labelling: null,  // {id, boxName} while giving a box a (new) label
   mode: "create",   // "create" (Add a box) or "alter" (Change a box)
   viewBack: "stepHome", // where Back on the box page goes
+  placeId: "",      // where a new box is ("" = the default place, made on first save)
+  places: [],       // [{id, name, boxCount}]
   boxInfo: null,    // response from /api/box
   photos: [],       // [{blob, url}]
   draft: null,      // response from /api/analyze
@@ -38,9 +40,100 @@ function setMode(mode) {
   $("noLabelBtn").hidden = alter;
   $("labelLaterBtn").textContent = alter ? "Pick an unlabelled box" : "Label an unlabelled box";
   $("startBtn").textContent = alter ? "Open" : "Start";
+  $("placeField").hidden = alter;
   $("boxNumber").value = "";
   resetLabelResult();
   show("stepBox");
+  if (!alter) { loadPlaces().then(suggestPlaceFromGps); }
+}
+
+// ---------- places ----------
+async function loadPlaces() {
+  let res;
+  try { res = await api("/api/places"); } catch (e) { toast(e.message, true); return; }
+  state.places = res.places;
+  state.defaultPlace = res.defaultPlace;
+  if (!state.places.some((p) => p.id === state.placeId)) {
+    const remembered = load("last-place");
+    const byDefault = state.places.find((p) => p.name.toLowerCase() === res.defaultPlace.toLowerCase());
+    state.placeId = (state.places.find((p) => p.id === remembered) || byDefault || state.places[0] || {}).id || "";
+  }
+  renderPlacePick($("placePick"), state.placeId, res.suggestions);
+}
+function renderPlacePick(select, selected, suggestions = []) {
+  select.innerHTML = "";
+  const add = (parent, value, text) => {
+    const o = document.createElement("option"); o.value = value; o.textContent = text; parent.appendChild(o); return o;
+  };
+  if (!state.places.length) add(select, "", state.defaultPlace || "Storage Unit");
+  for (const p of state.places) add(select, p.id, p.boxCount ? `${p.name} (${p.boxCount} box${p.boxCount === 1 ? "" : "es"})` : p.name);
+  if (suggestions.length) {
+    const g = document.createElement("optgroup"); g.label = "Rooms from Home Assistant";
+    suggestions.forEach((name) => add(g, `ha:${name}`, name));
+    select.appendChild(g);
+  }
+  add(select, "__new", "+ Add a new place…");
+  select.value = selected;
+  select.dataset.current = selected;
+}
+// Returns the chosen place id, creating the place first if needed ("" if cancelled).
+async function choosePlace(select) {
+  let value = select.value;
+  if (value === "__new" || value.startsWith("ha:")) {
+    const name = value === "__new" ? (prompt("Name of the place (e.g. Workshop, Under the stairs)") || "").trim() : value.slice(3);
+    if (!name) { select.value = select.dataset.current; return ""; }
+    const fd = new FormData(); fd.append("name", name);
+    let place;
+    try { place = await api("/api/places", { method: "POST", body: fd }); }
+    catch (e) { toast(e.message, true); select.value = select.dataset.current; return ""; }
+    await loadPlaces();
+    value = place.id;
+  }
+  return value;
+}
+function placeName(id) { return (state.places.find((p) => p.id === id) || {}).name || state.defaultPlace || ""; }
+
+// The phone's position, used to learn where each place is and to preselect it next time.
+// GPS can tell home from the lockup, not one room from another, so at home it keeps the last room used.
+function position(maxAgeMs) {
+  return new Promise((res) => {
+    if (!navigator.geolocation || !window.isSecureContext) return res(null);
+    navigator.geolocation.getCurrentPosition((p) => res(p.coords), () => res(null),
+      { timeout: 8000, maximumAge: maxAgeMs, enableHighAccuracy: false });
+  });
+}
+function metres(a, b) {
+  const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+async function learnPlace(placeId) {
+  if (!placeId) return;
+  const c = await position(0); // a fresh fix: an old one could be from before you got here
+  if (!c) return;
+  const all = load("place-coords") || {};
+  const old = all[placeId];
+  const n = Math.min((old?.n || 0) + 1, 10);
+  all[placeId] = old && metres(old, { lat: c.latitude, lon: c.longitude }) < 500
+    ? { lat: old.lat + (c.latitude - old.lat) / n, lon: old.lon + (c.longitude - old.lon) / n, n, used: Date.now() }
+    : { lat: c.latitude, lon: c.longitude, n: 1, used: Date.now() };
+  store("place-coords", all);
+}
+async function suggestPlaceFromGps() {
+  const all = load("place-coords") || {};
+  const known = Object.keys(all).filter((id) => state.places.some((p) => p.id === id));
+  $("placeHint").textContent = "";
+  if (!known.length) return;
+  const c = await position(0);
+  if (!c) return;
+  const here = { lat: c.latitude, lon: c.longitude };
+  const near = known.filter((id) => metres(all[id], here) < 200).sort((a, b) => all[b].used - all[a].used);
+  if (!near.length || near.includes(state.placeId)) return;
+  state.placeId = near[0];
+  $("placePick").value = near[0];
+  $("placePick").dataset.current = near[0];
+  $("placeHint").textContent = `Picked ${placeName(near[0])} because you're there. Change it if that's wrong.`;
 }
 function busy(text) { $("busyText").textContent = text || "Working…"; $("busy").hidden = !text; }
 let toastTimer;
@@ -136,21 +229,24 @@ function openBox(info) {
   $("boxBadge").hidden = false;
 
   const note = $("existingNote");
+  let html = "";
   if (info.exists && info.items.length) {
     const list = info.items.slice(0, 8).map((i) => `<li>${escapeHtml(i.name)} ×${i.quantity}</li>`).join("");
     const more = info.items.length > 8 ? `<li>…and ${info.items.length - 8} more</li>` : "";
-    note.innerHTML = `<strong>${escapeHtml(info.boxName)} already has ${info.items.length} item(s).</strong>
+    html = `<strong>${escapeHtml(info.boxName)} already has ${info.items.length} item(s).</strong>
       Anything you add now is added to it; Claude will skip what's already recorded.<ul>${list}${more}</ul>`;
-    note.hidden = false;
   } else if (info.exists) {
-    note.textContent = `${info.boxName} exists in Homebox but has no items yet.`;
-    note.hidden = false;
+    html = `${escapeHtml(info.boxName)} exists in Homebox but has no items yet.`;
   } else if (info.unlabelled) {
-    note.textContent = "It will be saved as the next “Unlabelled” box. Once it has a label, use “Label an unlabelled box” to give it its number.";
-    note.hidden = false;
-  } else {
-    note.hidden = true;
+    html = "It will be saved as the next “Unlabelled” box. Once it has a label, use “Label an unlabelled box” to give it its number.";
   }
+  if (info.exists && info.place?.id) {
+    const moving = state.placeId && info.place.id !== state.placeId;
+    html += `<p>${escapeHtml(seenText(info, true))}` +
+      (moving ? ` <strong>Saving will move it to ${escapeHtml(placeName(state.placeId))}.</strong>` : "") + "</p>";
+  }
+  note.innerHTML = html;
+  note.hidden = !html;
 
   clearPhotos();
   if (state.labelPhoto) { state.photos.push(state.labelPhoto); state.labelPhoto = null; renderPhotos(); }
@@ -220,6 +316,7 @@ async function showUnlabelled() {
     div.innerHTML = `<h3></h3><p></p><div class="row"><button class="secondary" type="button">Open</button>
       <button class="primary" type="button">Give it a label</button></div>`;
     div.querySelector("h3").textContent = b.boxName;
+    div.querySelector("h3").textContent = b.place ? `${b.boxName} · ${b.place}` : b.boxName;
     div.querySelector("p").textContent = b.itemCount
       ? b.items.join(", ") + (b.itemCount > b.items.length ? ` and ${b.itemCount - b.items.length} more` : "")
       : "No items yet";
@@ -243,6 +340,7 @@ function setLabellingMode(on) {
   $("labellingNote").hidden = !on;
   $("otherActions").hidden = on;
   $("cancelLabelling").hidden = !on;
+  $("placeField").hidden = on || state.mode === "alter";
   $("startBtn").textContent = on ? "Save label" : state.mode === "alter" ? "Open" : "Start";
   $("boxNumber").value = "";
   resetLabelResult();
@@ -433,6 +531,7 @@ async function save() {
   if (!items.length && !state.photos.length) { toast("Nothing to save yet."); return; }
   const fd = new FormData();
   addBoxFields(fd);
+  fd.append("location_id", state.placeId);
   fd.append("items", JSON.stringify(items));
   fd.append("transcript", $("transcript").value.trim());
   fd.append("box_summary", state.draft?.box_summary || "");
@@ -445,7 +544,10 @@ async function save() {
   forget(draftKey());
   if (!state.box) state.boxId = res.boxId; // a new box without a label is now known by its id
   $("doneTitle").textContent = `${res.boxName} saved`;
-  $("doneText").textContent = `${res.itemsSaved} item(s) and ${res.photosSaved} photo(s) added${res.created ? " to a new box" : ""}.`;
+  $("doneText").textContent = `${res.itemsSaved} item(s) and ${res.photosSaved} photo(s) added` +
+    `${res.created ? " to a new box" : ""} in ${res.place}.` + (res.movedFrom ? ` Moved here from ${res.movedFrom}.` : "");
+  const placeId = state.places.find((p) => p.name === res.place)?.id;
+  if (placeId) { state.placeId = placeId; store("last-place", placeId); learnPlace(placeId); }
   const link = $("doneLink");
   if (res.link) { link.href = res.link; link.hidden = false; } else link.hidden = true;
   $("nextBox").textContent = nextNumber() ? `Next box (${nextNumber()})` : "Next box";
@@ -474,6 +576,43 @@ function renderViewMeta() {
   const bits = [`${info.items.length} item(s)`, `${info.photoCount} photo(s)`];
   $("viewMeta").innerHTML = escapeHtml(bits.join(" · ")) +
     (info.link ? ` · <a href="${escapeHtml(info.link)}" target="_blank" rel="noopener">Open in Homebox</a>` : "");
+  $("viewSeen").textContent = seenText(info);
+  if (!state.places.some((p) => p.id === info.place?.id)) state.places.push({ ...info.place, boxCount: 1 });
+  renderPlacePick($("viewPlace"), info.place?.id || "");
+}
+async function moveBox() {
+  const id = await choosePlace($("viewPlace"));
+  if (!id || id === state.boxInfo.place?.id) { $("viewPlace").value = state.boxInfo.place?.id || ""; return; }
+  const fd = new FormData(); fd.append("location_id", id);
+  busy("Moving…");
+  let info;
+  try { info = await api(`/api/box-by-id/${encodeURIComponent(state.boxInfo.id)}/move`, { method: "POST", body: fd }); }
+  catch (e) { busy(); toast(e.message, true); renderViewMeta(); return; }
+  busy();
+  state.boxInfo = info;
+  renderViewMeta();
+  toast(`${info.boxName} moved to ${info.place.name}.`);
+}
+
+// "Last seen 3 days ago in Workshop: spotted in a photo, top shelf"
+function whenText(at) {
+  const d = new Date(at.replace(" ", "T"));
+  if (isNaN(d)) return at;
+  const days = Math.floor((new Date().setHours(0, 0, 0, 0) - new Date(d).setHours(0, 0, 0, 0)) / 86400000);
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (days <= 0) return `today at ${time}`;
+  if (days === 1) return `yesterday at ${time}`;
+  if (days < 14) return `${days} days ago`;
+  return `on ${d.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" })}`;
+}
+function seenText(info, short = false) {
+  const place = info.place?.name || info.place || "";
+  const ls = info.lastSeen;
+  if (!ls) return place ? `In ${place}.` : "";
+  const how = [ls.how, ls.spot].filter(Boolean).join(": ");
+  if (short) return `In ${place}, last seen ${whenText(ls.at)}.`;
+  return `In ${place}. Last seen ${whenText(ls.at)}${ls.place && ls.place !== place ? ` in ${ls.place}` : ""}` +
+    (how ? ` (${how})` : "") + ".";
 }
 function addViewItem(item) {
   const node = $("viewItemTpl").content.firstElementChild.cloneNode(true);
@@ -587,7 +726,10 @@ function resultCard(g, q, withWhy) {
     `${highlight(i.name, q)} ×${i.quantity}${i.description ? ` · ${highlight(i.description, q)}` : ""}` +
     (withWhy && i.why ? ` <span class="why">— ${escapeHtml(i.why)}</span>` : "") + "</li>").join("");
   const more = g.items.length > 6 ? `<li>…and ${g.items.length - 6} more</li>` : "";
-  b.innerHTML = `<strong>${highlight(g.boxName, q)}</strong>${items || more ? `<ul>${items}${more}</ul>` : ""}`;
+  const where = g.place ? ` <span class="where">· ${highlight(g.place, q)}</span>` : "";
+  const seen = g.lastSeen ? `<span class="seen-line">Last seen ${escapeHtml(whenText(g.lastSeen.at))}` +
+    (g.lastSeen.spot ? `: ${escapeHtml(g.lastSeen.spot)}` : "") + "</span>" : "";
+  b.innerHTML = `<strong>${highlight(g.boxName, q)}</strong>${where}${seen}${items || more ? `<ul>${items}${more}</ul>` : ""}`;
   b.onclick = () => startBoxById(g.boxId, true, "stepFind");
   return b;
 }
@@ -622,7 +764,7 @@ function renderFind() {
   (findState.claude ? confident : quick).forEach((g) => boxes.set(g.boxId, g));
   const labelled = [...boxes.values()].filter((g) => !g.unlabelled).slice(0, 12);
   $("findSummary").hidden = !boxes.size;
-  const names = [...boxes.values()].map((g) => g.boxName);
+  const names = [...boxes.values()].map((g) => g.place ? `${g.boxName} (${g.place})` : g.boxName);
   $("findSummary").textContent = names.length <= 4
     ? `In ${names.length > 1 ? names.slice(0, -1).join(", ") + " and " + names.at(-1) : names[0]}`
     : `In ${names.length} boxes`;
@@ -696,11 +838,22 @@ $("findLocatePhoto").onchange = (e) => {
   if (f) locate(f, findState.locateBoxes, FIND_LOCATE);
 };
 $("viewBack").onclick = () => show(state.viewBack);
-$("viewAdd").onclick = () => { state.mode = "create"; openBox(state.boxInfo); };
+$("viewAdd").onclick = () => {
+  state.mode = "create";
+  state.placeId = state.boxInfo.place?.id || state.placeId; // adding to it where it is, not moving it
+  openBox(state.boxInfo);
+};
 $("viewLabel").onclick = () => {
   state.mode = "alter";
   startLabelling({ id: state.boxInfo.id, boxName: state.boxInfo.boxName, unlabelled: state.boxInfo.unlabelled });
 };
+$("placePick").onchange = async () => {
+  const id = await choosePlace($("placePick"));
+  if (id === "" && $("placePick").value !== "") return;
+  state.placeId = id; $("placePick").value = id; $("placePick").dataset.current = id;
+  store("last-place", id); $("placeHint").textContent = "";
+};
+$("viewPlace").onchange = moveBox;
 $("locatePhoto").onchange = (e) => {
   const f = e.target.files[0]; e.target.value = "";
   if (f) locate(f, [{ id: state.boxInfo.id, boxName: state.boxInfo.boxName }], VIEW_LOCATE);
@@ -729,8 +882,6 @@ $("sameBox").onclick = () => { state.mode = "create"; state.boxId ? startBoxById
     const remembered = load("last-colour");
     state.colour = names.includes(remembered) ? remembered : (names.length === 1 ? names[0] : "");
     renderColours();
-    if (window.APP_CONFIG.parentLocation) {
-      $("boxHint").textContent += `${last ? " · " : ""}Boxes are saved in “${window.APP_CONFIG.parentLocation}”.`;
-    }
+    state.defaultPlace = window.APP_CONFIG.defaultPlace;
   } catch (e) { toast(e.message, true); }
 })();

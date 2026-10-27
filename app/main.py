@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import logging
 import secrets
@@ -19,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .analyze import AnalysisError, analyze_box, locate_boxes, read_label
 from .config import Settings, settings as default_settings
+from .homeassistant import area_names
 from .homebox import Homebox, HomeboxError, Photo
 from .search import box_matches, claude_search, fuzzy_search
 
@@ -72,14 +74,87 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
     def hb(request: Request) -> Homebox:
         return request.app.state.homebox
 
-    async def parent_id(request: Request, create: bool) -> str | None:
-        if not settings.parent_location:
-            return None
-        if create:
-            loc, _ = await hb(request).ensure_location(settings.parent_location, None)
-            return loc["id"]
-        loc = await hb(request).find_location(settings.parent_location, None)
-        return loc["id"] if loc else ""  # "" = parent doesn't exist yet, so no box can either
+    # ---- places and boxes ------------------------------------------------
+    # Places (Workshop, Lockup…) are Homebox locations at the top level, or inside STORAGE_ROOT.
+    # Boxes are locations with a box name (Box Red 032, Unlabelled 003) inside a place.
+    # Box names are unique everywhere, so a box keeps its name when it moves.
+    # One listing of every location serves all of this; it's kept for 30 seconds and
+    # dropped whenever this app changes something.
+    layout_cache: dict = {"at": 0.0, "data": None}
+    catalogue_cache: dict = {"at": 0.0, "data": None}
+
+    def forget_catalogue() -> None:
+        layout_cache["data"] = None
+        catalogue_cache["data"] = None
+
+    def parent_of(e: dict) -> str | None:
+        return (e.get("parent") or {}).get("id")
+
+    async def layout(request: Request) -> dict:
+        if layout_cache["data"] and time.monotonic() - layout_cache["at"] < 30:
+            return layout_cache["data"]
+        locs = await hb(request).find_locations("", None)
+        root: str | None = None
+        if settings.storage_root:
+            want = settings.storage_root.strip().lower()
+            found = next((l for l in locs if not parent_of(l) and l["name"].strip().lower() == want), None)
+            root = found["id"] if found else ""  # "" = not created yet, so no places either
+        places = {} if root == "" else {
+            l["id"]: l for l in locs
+            if parent_of(l) == root and l["id"] != root and not settings.is_box_name(l["name"])}
+        boxes = {l["id"]: l for l in locs if parent_of(l) in places and settings.is_box_name(l["name"])}
+        data = {"root": root, "places": places, "boxes": boxes,
+                "by_name": {b["name"].strip().lower(): b for b in boxes.values()}}
+        layout_cache.update(at=time.monotonic(), data=data)
+        return data
+
+    async def ensure_place(request: Request, name: str) -> dict:
+        name = " ".join(name.split())[:255]
+        if not name:
+            raise HTTPException(400, "Give the place a name.")
+        if settings.is_box_name(name):
+            raise HTTPException(400, f"“{name}” looks like a box name. Pick another name for the place.")
+        lay = await layout(request)
+        for p in lay["places"].values():
+            if p["name"].strip().lower() == name.lower():
+                return p
+        root = lay["root"]
+        if root == "":
+            root_loc, _ = await hb(request).ensure_location(settings.storage_root, None)
+            root = root_loc["id"]
+        place = await hb(request).create_entity(name, "location", root)
+        log.info("Added place %s", name)
+        forget_catalogue()
+        return place
+
+    async def pick_place(request: Request, location_id: str) -> dict:
+        """The place a form asked for, or the default place."""
+        lay = await layout(request)
+        if location_id.strip():
+            if location_id.strip() not in lay["places"]:
+                raise HTTPException(400, "That place no longer exists. Pick another.")
+            return lay["places"][location_id.strip()]
+        return await ensure_place(request, settings.default_place)
+
+    LAST_SEEN = "Last seen"
+
+    def last_seen(entity: dict) -> dict | None:
+        """{"at", "place", "how", "spot"} from the box's "Last seen" field."""
+        for f in entity.get("fields") or []:
+            if f.get("name") == LAST_SEEN and f.get("textValue"):
+                parts = [x.strip() for x in str(f["textValue"]).split(" · ")]
+                parts += [""] * (4 - len(parts))
+                return {"at": parts[0], "place": parts[1], "how": parts[2], "spot": " · ".join(parts[3:]).strip(" ·")}
+        return None
+
+    async def mark_seen(request: Request, box_id: str, how: str, spot: str = "") -> None:
+        """Record when and where a box was last seen, in a "Last seen" field Homebox shows too."""
+        current = await hb(request).get_entity(box_id)
+        place = (current.get("parent") or {}).get("name", "")
+        text = " · ".join(x for x in (datetime.now().strftime("%Y-%m-%d %H:%M"), place, how, spot.strip()) if x)
+        fields = [f for f in current.get("fields") or [] if f.get("name") != LAST_SEEN]
+        fields.append({"name": LAST_SEEN, "type": "text", "textValue": text})
+        await hb(request).update_entity(box_id, current, fields=fields)
 
     def box_name(number: str, colour: str) -> str:
         try:
@@ -125,7 +200,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
     @app.get("/api/config")
     async def config():
         return {
-            "parentLocation": settings.parent_location,
+            "defaultPlace": settings.default_place,
             "colours": [{"name": n, "css": css} for n, css in settings.box_colours],
             "exampleBoxName": settings.box_name("1", settings.box_colours[0][0] if settings.box_colours else ""),
             "maxPhotos": MAX_PHOTOS,
@@ -137,11 +212,10 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             box = await hb(request).get_entity(box_id)
         except HomeboxError:
             raise HTTPException(404, "That box no longer exists in Homebox.")
-        if not (box.get("entityType") or {}).get("isLocation", True):
-            raise HTTPException(400, "That isn't a box.")
-        pid = await parent_id(request, create=False)
-        if pid is not None and (box.get("parent") or {}).get("id") != pid:
-            raise HTTPException(400, f"That box isn't in “{settings.parent_location}”.")
+        if box_id not in (await layout(request))["boxes"]:
+            forget_catalogue()  # maybe it's new: look again
+            if box_id not in (await layout(request))["boxes"]:
+                raise HTTPException(400, "That isn't one of your boxes.")
         return box
 
     async def box_info(request: Request, name: str, box: dict | None) -> dict:
@@ -151,8 +225,10 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         full = box if "attachments" in box else await hb(request).get_entity(box["id"])
         items = [summarize(i) for i in await hb(request).children(box["id"])]
         photos = [a for a in full.get("attachments") or [] if a.get("type") == "photo"]
+        parent = full.get("parent") or {}
         return {
             "boxName": full["name"], "exists": True, "unlabelled": unlabelled, "id": box["id"],
+            "place": {"id": parent.get("id"), "name": parent.get("name", "")}, "lastSeen": last_seen(full),
             "link": box_link(box["id"]), "items": items, "photoCount": len(photos), "notes": full.get("notes") or "",
         }
 
@@ -166,17 +242,46 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             return box["name"], box
         if number.strip():
             name = box_name(number, colour)
-            pid = await parent_id(request, create=False)
-            return name, (None if pid == "" else await hb(request).find_location(name, pid))
+            return name, (await layout(request))["by_name"].get(name.lower())
         return None, None
 
     async def unlabelled_boxes(request: Request) -> list[dict]:
-        pid = await parent_id(request, create=False)
-        if pid == "":
-            return []
-        found = await hb(request).find_locations(settings.unlabelled_prefix, pid)
-        boxes = [b for b in found if settings.unlabelled_number(b["name"]) is not None]
+        boxes = [b for b in (await layout(request))["boxes"].values() if settings.unlabelled_number(b["name"]) is not None]
         return sorted(boxes, key=lambda b: settings.unlabelled_number(b["name"]))
+
+    @app.get("/api/places")
+    async def list_places(request: Request):
+        """Places boxes can live in, plus Home Assistant areas that could become places."""
+        lay = await layout(request)
+        counts: dict[str, int] = {}
+        for b in lay["boxes"].values():
+            counts[parent_of(b)] = counts.get(parent_of(b), 0) + 1
+        places = sorted(({"id": p["id"], "name": p["name"], "boxCount": counts.get(p["id"], 0)}
+                         for p in lay["places"].values()), key=lambda p: p["name"].lower())
+        have = {p["name"].strip().lower() for p in places}
+        areas = await area_names(settings.ha_url, settings.ha_token)
+        return {"places": places, "suggestions": [a for a in areas if a.lower() not in have],
+                "defaultPlace": settings.default_place}
+
+    @app.post("/api/places")
+    async def add_place(request: Request, name: str = Form(...)):
+        place = await ensure_place(request, name)
+        return {"id": place["id"], "name": place["name"]}
+
+    @app.post("/api/box-by-id/{box_id}/move")
+    async def move_box(box_id: str, request: Request, location_id: str = Form(...)):
+        """Move a box to another place."""
+        box = await box_by_id(request, box_id)
+        place = await pick_place(request, location_id)
+        old = (box.get("parent") or {}).get("name", "")
+        if parent_of(box) != place["id"]:
+            await hb(request).update_entity(box_id, box, parentId=place["id"])
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            await hb(request).append_notes(box_id, f"[{stamp}] Moved from {old} to {place['name']}.")
+            await mark_seen(request, box_id, "moved here")
+            log.info("Moved %s from %s to %s", box["name"], old, place["name"])
+            forget_catalogue()
+        return await box_info(request, box["name"], await hb(request).get_entity(box_id))
 
     @app.get("/api/box/{number}")
     async def get_box(number: str, request: Request, colour: str = ""):
@@ -201,6 +306,8 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         box = None
         if label["has_label"] and (label["colour"] or not colours):
             name, found = await resolve_box(request, label["number"], label["colour"], "")
+            if found and label["confidence"] == "high":
+                await mark_seen(request, found["id"], "label photographed")
             box = await box_info(request, name, found)
         return {"label": label, "box": box}
 
@@ -210,6 +317,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         for b in await unlabelled_boxes(request):
             items = await hb(request).children(b["id"])
             boxes.append({"id": b["id"], "boxName": b["name"], "itemCount": len(items),
+                          "place": (b.get("parent") or {}).get("name", ""),
                           "items": [i["name"] for i in items[:6]], "link": box_link(b["id"])})
         return {"boxes": boxes}
 
@@ -220,8 +328,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         name = box_name(box_number, colour)
         if name == box["name"]:
             return await box_info(request, name, box)
-        pid = await parent_id(request, create=False)
-        clash = await hb(request).find_location(name, pid or None)
+        clash = (await layout(request))["by_name"].get(name.lower())
         if clash and clash["id"] != box_id:
             raise HTTPException(409, f"{name} already exists. Check the label, or open {name} to see what's in it.")
         old = box["name"]
@@ -232,49 +339,46 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         forget_catalogue()
         return await box_info(request, name, await hb(request).get_entity(box_id))
 
-    async def our_boxes(request: Request) -> dict[str, dict]:
-        """Every box inside the parent location, by id."""
-        pid = await parent_id(request, create=False)
-        if pid == "":
-            return {}
-        if pid is None:
-            found = await hb(request).find_locations("", None)
-            return {b["id"]: b for b in found}
-        return {b["id"]: b for b in await hb(request).children(pid)}
-
-    # The whole inventory, flattened, for searching. Kept for a minute and dropped whenever
-    # this app changes something, so typing a search doesn't hit Homebox on every key.
-    catalogue_cache: dict = {"at": 0.0, "data": None}
-
-    def forget_catalogue() -> None:
-        catalogue_cache["data"] = None
-
     async def catalogue(request: Request) -> tuple[list[dict], list[dict]]:
+        """The whole inventory, flattened, for searching. Kept for a minute (see layout())."""
         if catalogue_cache["data"] and time.monotonic() - catalogue_cache["at"] < 60:
             return catalogue_cache["data"]
-        boxes = await our_boxes(request)
+        lay = await layout(request)
+        boxes, places = lay["boxes"], lay["places"]
+
+        def place_name(box: dict) -> str:
+            return (places.get(parent_of(box)) or {}).get("name", "")
+
         items = []
         for e in await hb(request).search("", limit=20000):
-            parent = (e.get("parent") or {}).get("id")
+            parent = parent_of(e)
             if parent in boxes and e["id"] not in boxes:
-                items.append({**summarize(e), "boxId": parent, "boxName": boxes[parent]["name"]})
-        data = (items, [{"id": b["id"], "name": b["name"]} for b in boxes.values()])
+                items.append({**summarize(e), "boxId": parent, "boxName": boxes[parent]["name"],
+                              "place": place_name(boxes[parent])})
+        data = (items, [{"id": b["id"], "name": b["name"], "place": place_name(b)} for b in boxes.values()])
         catalogue_cache.update(at=time.monotonic(), data=data)
         return data
 
-    def group_by_box(items: list[dict], boxes: list[dict] = ()) -> list[dict]:
-        """Results grouped by box, in the order the items came (best first)."""
+    async def group_by_box(request: Request, items: list[dict], boxes: list[dict] = ()) -> list[dict]:
+        """Results grouped by box, in the order the items came (best first), with where each box is."""
         groups: dict[str, dict] = {}
         for b in boxes:
             groups[b["id"]] = {"boxId": b["id"], "boxName": b["name"], "boxMatches": True, "items": []}
         for i in items:
             g = groups.setdefault(i["boxId"], {"boxId": i["boxId"], "boxName": i["boxName"],
                                                "boxMatches": False, "items": []})
-            g["items"].append({k: v for k, v in i.items() if k not in ("boxId", "boxName", "score")})
-        for g in groups.values():
+            g["items"].append({k: v for k, v in i.items() if k not in ("boxId", "boxName", "place", "score")})
+        groups_list = list(groups.values())[:30]
+        # Where each box is and when it was last seen (one Homebox read per box, in parallel)
+        entities = await asyncio.gather(*(hb(request).get_entity(g["boxId"]) for g in groups_list),
+                                        return_exceptions=True)
+        for g, e in zip(groups_list, entities):
             g["link"] = box_link(g["boxId"])
             g["unlabelled"] = settings.unlabelled_number(g["boxName"]) is not None
-        return list(groups.values())
+            ok = isinstance(e, dict)
+            g["place"] = (e.get("parent") or {}).get("name", "") if ok else ""
+            g["lastSeen"] = last_seen(e) if ok else None
+        return groups_list
 
     @app.get("/api/search")
     async def search(request: Request, q: str = ""):
@@ -283,7 +387,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         if len(q) < 2:
             return {"query": q, "results": []}
         items, boxes = await catalogue(request)
-        return {"query": q, "results": group_by_box(fuzzy_search(q, items)[:200], box_matches(q, boxes))}
+        return {"query": q, "results": await group_by_box(request, fuzzy_search(q, items)[:200], box_matches(q, boxes))}
 
     @app.get("/api/search/claude")
     async def search_claude(request: Request, q: str = ""):
@@ -295,7 +399,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         res = await run_in_threadpool(claude_search, request.app.state.claude,
                                       settings.search_model or settings.claude_model, q, items)
         log.info("Claude search %r: %d matches, usage %s", q, len(res["matches"]), res["usage"])
-        return {"query": q, "results": group_by_box(res["matches"]), "note": res["note"]}
+        return {"query": q, "results": await group_by_box(request, res["matches"]), "note": res["note"]}
 
     async def our_item(request: Request, item_id: str) -> dict:
         try:
@@ -360,6 +464,9 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         results = [{"boxId": box["id"], "boxName": box["name"], **r}
                    for (box, _), r in zip(targets, res["results"])]
         log.info("Located %s: %s", [t for _, t in targets], [(r["target"], r["found"]) for r in results])
+        for r in results:
+            if r["found"] and r["confidence"] != "low":
+                await mark_seen(request, r["boxId"], "spotted in a photo", r["where"])
         return {"results": results, "seen": res["seen"]}
 
     @app.post("/api/analyze")
@@ -379,7 +486,8 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
 
     @app.post("/api/save")
     async def save(request: Request, box_number: str = Form(""), colour: str = Form(""), box_id: str = Form(""),
-                   items: str = Form("[]"), transcript: str = Form(""), box_summary: str = Form(""),
+                   location_id: str = Form(""), items: str = Form("[]"), transcript: str = Form(""),
+                   box_summary: str = Form(""),
                    photos: list[UploadFile] = File(default=[])):
         try:
             item_list = json.loads(items)
@@ -391,15 +499,21 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         pics = await read_photos(photos)
         client = hb(request)
 
-        pid = await parent_id(request, create=True)
+        moved_from = None
         if box:
             created = False
-        elif name:
-            box, created = await client.ensure_location(name, pid)
+            # You're standing with the box, so if you picked a different place, it has moved.
+            if location_id.strip() and location_id.strip() != parent_of(box):
+                place = await pick_place(request, location_id)
+                moved_from = (box.get("parent") or {}).get("name", "")
+                box = await client.update_entity(box["id"], await client.get_entity(box["id"]), parentId=place["id"])
         else:
-            taken = [settings.unlabelled_number(b["name"]) for b in await unlabelled_boxes(request)]
-            name = settings.unlabelled_name(max(taken, default=0) + 1)
-            box, created = await client.create_entity(name, "location", pid), True
+            place = await pick_place(request, location_id)
+            if not name:
+                taken = [settings.unlabelled_number(b["name"]) for b in await unlabelled_boxes(request)]
+                name = settings.unlabelled_name(max(taken, default=0) + 1)
+            box, created = await client.create_entity(name, "location", place["id"]), True
+        forget_catalogue()
         box_id = box["id"]
 
         all_tags = sorted({t.strip() for i in item_list for t in i.get("tags") or [] if t.strip()})
@@ -433,10 +547,14 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
                 parts.append(f"Spoken description: {transcript.strip()}")
             await client.append_notes(box_id, "\n".join(parts))
 
+        if moved_from is not None:
+            await client.append_notes(box_id, f"[{stamp}] Moved from {moved_from}.")
+        await mark_seen(request, box_id, "photographed" if pics else "updated")
         log.info("Saved %s: %d items, %d photos", name, len(saved), len(pics))
         forget_catalogue()
+        place_name = ((await client.get_entity(box_id)).get("parent") or {}).get("name", "")
         return {"boxName": name, "boxId": box_id, "created": created, "itemsSaved": len(saved),
-                "photosSaved": len(pics), "link": box_link(box_id)}
+                "photosSaved": len(pics), "link": box_link(box_id), "place": place_name, "movedFrom": moved_from}
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app

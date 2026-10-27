@@ -34,8 +34,17 @@ class Settings:
     homebox_username: str = field(default_factory=lambda: os.environ.get("HOMEBOX_USERNAME", ""))
     homebox_password: str = field(default_factory=lambda: os.environ.get("HOMEBOX_PASSWORD", ""))
 
-    # All boxes are created inside this location. Leave empty to put boxes at the top level.
-    parent_location: str = field(default_factory=lambda: os.environ.get("PARENT_LOCATION", "Storage Unit"))
+    # Places where boxes are kept (Workshop, Under the stairs, Lockup…) are Homebox locations.
+    # They sit at Homebox's top level, or inside STORAGE_ROOT if you set one (e.g. "Home").
+    # Each box is a location inside one of them: Workshop › Box Red 032.
+    storage_root: str = field(default_factory=lambda: os.environ.get("STORAGE_ROOT", ""))
+    # Place for new boxes until you pick one. PARENT_LOCATION is the old name for this setting.
+    default_place: str = field(default_factory=lambda: os.environ.get(
+        "DEFAULT_PLACE", os.environ.get("PARENT_LOCATION", "Storage Unit")))
+
+    # Home Assistant, to offer its areas (rooms) as places. Optional.
+    ha_url: str = field(default_factory=lambda: os.environ.get("HA_URL", "").rstrip("/"))
+    ha_token: str = field(default_factory=lambda: os.environ.get("HA_TOKEN", ""))
     # Label colours in use. The same number in two colours is two different boxes.
     # Optionally give a screen colour: "Red, Blue, Green=#2e7d32". Empty = no colours.
     box_colours: tuple[tuple[str, str], ...] = field(
@@ -63,6 +72,9 @@ class Settings:
 
     def unlabelled_name(self, n: int) -> str:
         return f"{self.unlabelled_prefix} {str(n).zfill(self.box_number_digits)}"
+
+    def is_box_name(self, name: str) -> bool:
+        return self.unlabelled_number(name) is not None or self.parse_box_name(name) is not None
 
     def unlabelled_number(self, name: str) -> int | None:
         """3 for "Unlabelled 003", None for anything that isn't an unlabelled box name."""

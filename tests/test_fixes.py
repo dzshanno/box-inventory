@@ -101,3 +101,25 @@ def test_unlabelled_names():
     assert s.unlabelled_number(" unlabelled 12 ") == 12
     assert s.unlabelled_number("Unlabelled stuff") is None
     assert s.unlabelled_number("Box Red 003") is None
+
+
+def test_home_assistant_areas():
+    import asyncio
+    import json as _json
+    from app import homeassistant
+
+    def handler(request):
+        assert request.headers["authorization"] == "Bearer tok"
+        assert "areas()" in _json.loads(request.content)["template"]
+        return httpx.Response(200, text='["Workshop", "Dressing room", " ", "Under the stairs"]')
+
+    homeassistant._cache.update(at=0.0, areas=[])
+    got = asyncio.run(homeassistant.area_names("http://ha", "tok", httpx.MockTransport(handler)))
+    assert got == ["Dressing room", "Under the stairs", "Workshop"]
+    assert asyncio.run(homeassistant.area_names("", "")) == []
+
+    # Home Assistant down: keep what we had
+    homeassistant._cache.update(at=0.0)
+    def down(request):
+        raise httpx.ConnectError("refused", request=request)
+    assert asyncio.run(homeassistant.area_names("http://ha", "tok", httpx.MockTransport(down))) == got

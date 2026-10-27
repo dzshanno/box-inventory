@@ -189,3 +189,12 @@ header h1 a { color: inherit; text-decoration: none; }
 .result ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 15px; }
 .result mark { background: var(--warn-bg); color: var(--warn-text); border-radius: 3px; padding: 0 2px; }
 #doneHome { width: auto; margin: 6px auto 0; }
+
+.place-pick { font: inherit; font-size: 18px; color: var(--text); background: var(--card); border: 2px solid var(--border);
+  border-radius: 12px; padding: 12px; width: 100%; }
+#placeField .big-label { margin-top: 4px; }
+.move-row { display: flex; align-items: center; gap: 10px; font-weight: 600; margin: 4px 0 10px; }
+.move-row .place-pick { flex: 1; font-size: 16px; padding: 8px 10px; border-width: 1px; }
+.seen { margin: 0 0 8px; font-size: 15px; }
+.result .where { color: var(--muted); font-weight: 400; }
+.result .seen-line { display: block; color: var(--muted); font-size: 14px; margin-top: 2px; }

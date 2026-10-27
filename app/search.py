@@ -72,7 +72,7 @@ def fuzzy_search(query: str, catalogue: list[dict]) -> list[dict]:
     out = []
     for item in catalogue:
         name, extra = words(item["name"]), words(item.get("description", "") + " " + " ".join(item.get("tags", [])))
-        box = words(item["boxName"])
+        box = words(item["boxName"] + " " + item.get("place", ""))
         total = 0.0
         for q in qs:
             s = max(_best(q, name), 0.85 * _best(q, extra), 0.9 * _best(q, box))
@@ -87,11 +87,11 @@ def fuzzy_search(query: str, catalogue: list[dict]) -> list[dict]:
 
 
 def box_matches(query: str, boxes: list[dict]) -> list[dict]:
-    """Boxes whose name matches every query word, e.g. "red 47" or "unlabelled 3"."""
+    """Boxes whose name or place matches every query word, e.g. "red 47", "unlabelled 3", "workshop"."""
     qs = query_words(query)
     if not qs:
         return []
-    return [b for b in boxes if all(_best(q, words(b["name"])) for q in qs)]
+    return [b for b in boxes if all(_best(q, words(b["name"] + " " + b.get("place", ""))) for q in qs)]
 
 
 SEARCH_PROMPT = """You help someone find things in the inventory of their storage boxes.
@@ -104,7 +104,7 @@ Speech-to-text and typing mistakes are common too.
 Rules:
 - Return every item that could be what they're after. The same kind of thing is often spread over \
 several boxes; include all of them.
-- Use the item's name, details, tags and box. Match on meaning, not just words.
+- Use the item's name, details, tags, box and place. Match on meaning, not just words.
 - "why" is a few words saying how it matches, e.g. "same thing, different name" or "camping gear".
 - confidence: "high" if it's clearly what they mean, "medium" if likely, "low" if it's a long shot \
 worth checking. Leave out things that don't fit at all.
@@ -128,13 +128,14 @@ SEARCH_SCHEMA = {
 
 def catalogue_text(catalogue: list[dict]) -> tuple[str, dict[str, dict]]:
     """One short line per item, in a fixed order so the prompt cache keeps working."""
-    rows = sorted(catalogue, key=lambda i: (i["boxName"], i["name"].lower(), i["id"]))
+    rows = sorted(catalogue, key=lambda i: (i.get("place", ""), i["boxName"], i["name"].lower(), i["id"]))
     lines, ids = [], {}
     for n, item in enumerate(rows, 1):
         key = f"i{n}"
         ids[key] = item
         qty = item.get("quantity") or 1
-        line = f"{key} | {item['boxName']} | {item['name']} x{qty:g}"
+        box = f"{item['boxName']} ({item['place']})" if item.get("place") else item["boxName"]
+        line = f"{key} | {box} | {item['name']} x{qty:g}"
         if item.get("description"):
             line += f" | {item['description']}"
         if item.get("tags"):
@@ -155,7 +156,7 @@ def claude_search(client: anthropic.Anthropic, model: str, query: str, catalogue
             system=[
                 {"type": "text", "text": SEARCH_PROMPT},
                 # The inventory is the same for every search until something changes, so cache it.
-                {"type": "text", "text": "Inventory (id | box | item x quantity | details | tags):\n" + text,
+                {"type": "text", "text": "Inventory (id | box (place) | item x quantity | details | tags):\n" + text,
                  "cache_control": {"type": "ephemeral"}},
             ],
             messages=[{"role": "user", "content": f"What I'm looking for: {query.strip()}"}],

@@ -35,6 +35,11 @@
   <!-- 1. Pick a box -->
   <section id="stepBox" class="step" hidden>
     <h2 id="boxStepTitle" class="step-title">Add a box</h2>
+    <div id="placeField">
+      <label for="placePick" class="big-label">Where is it?</label>
+      <select id="placePick" class="place-pick"></select>
+      <p id="placeHint" class="hint"></p>
+    </div>
     <div id="labellingNote" class="note" hidden></div>
     <label class="primary file-btn">
       <input id="labelPhoto" type="file" accept="image/*" capture="environment" hidden>
@@ -76,6 +81,8 @@
   <section id="stepView" class="step" hidden>
     <h2 id="viewTitle" class="step-title"></h2>
     <p id="viewMeta" class="hint"></p>
+    <p id="viewSeen" class="seen"></p>
+    <label class="move-row">Place <select id="viewPlace" class="place-pick"></select></label>
     <div id="viewItems"></div>
     <button id="viewAdd" class="primary" type="button">Add items</button>
     <label id="viewLocate" class="secondary file-btn">
