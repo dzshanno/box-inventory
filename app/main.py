@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -16,9 +17,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .analyze import AnalysisError, analyze_box, read_label
+from .analyze import AnalysisError, analyze_box, locate_boxes, read_label
 from .config import Settings, settings as default_settings
 from .homebox import Homebox, HomeboxError, Photo
+from .search import box_matches, claude_search, fuzzy_search
 
 log = logging.getLogger("box-inventory")
 STATIC = Path(__file__).parent / "static"
@@ -227,7 +229,138 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         await hb(request).append_notes(box_id, f"[{stamp}] Labelled {name} (was {old}).")
         log.info("Relabelled %s as %s", old, name)
+        forget_catalogue()
         return await box_info(request, name, await hb(request).get_entity(box_id))
+
+    async def our_boxes(request: Request) -> dict[str, dict]:
+        """Every box inside the parent location, by id."""
+        pid = await parent_id(request, create=False)
+        if pid == "":
+            return {}
+        if pid is None:
+            found = await hb(request).find_locations("", None)
+            return {b["id"]: b for b in found}
+        return {b["id"]: b for b in await hb(request).children(pid)}
+
+    # The whole inventory, flattened, for searching. Kept for a minute and dropped whenever
+    # this app changes something, so typing a search doesn't hit Homebox on every key.
+    catalogue_cache: dict = {"at": 0.0, "data": None}
+
+    def forget_catalogue() -> None:
+        catalogue_cache["data"] = None
+
+    async def catalogue(request: Request) -> tuple[list[dict], list[dict]]:
+        if catalogue_cache["data"] and time.monotonic() - catalogue_cache["at"] < 60:
+            return catalogue_cache["data"]
+        boxes = await our_boxes(request)
+        items = []
+        for e in await hb(request).search("", limit=20000):
+            parent = (e.get("parent") or {}).get("id")
+            if parent in boxes and e["id"] not in boxes:
+                items.append({**summarize(e), "boxId": parent, "boxName": boxes[parent]["name"]})
+        data = (items, [{"id": b["id"], "name": b["name"]} for b in boxes.values()])
+        catalogue_cache.update(at=time.monotonic(), data=data)
+        return data
+
+    def group_by_box(items: list[dict], boxes: list[dict] = ()) -> list[dict]:
+        """Results grouped by box, in the order the items came (best first)."""
+        groups: dict[str, dict] = {}
+        for b in boxes:
+            groups[b["id"]] = {"boxId": b["id"], "boxName": b["name"], "boxMatches": True, "items": []}
+        for i in items:
+            g = groups.setdefault(i["boxId"], {"boxId": i["boxId"], "boxName": i["boxName"],
+                                               "boxMatches": False, "items": []})
+            g["items"].append({k: v for k, v in i.items() if k not in ("boxId", "boxName", "score")})
+        for g in groups.values():
+            g["link"] = box_link(g["boxId"])
+            g["unlabelled"] = settings.unlabelled_number(g["boxName"]) is not None
+        return list(groups.values())
+
+    @app.get("/api/search")
+    async def search(request: Request, q: str = ""):
+        """Quick search as you type: forgiving word matching on items and box names."""
+        q = q.strip()
+        if len(q) < 2:
+            return {"query": q, "results": []}
+        items, boxes = await catalogue(request)
+        return {"query": q, "results": group_by_box(fuzzy_search(q, items)[:200], box_matches(q, boxes))}
+
+    @app.get("/api/search/claude")
+    async def search_claude(request: Request, q: str = ""):
+        """Search by meaning: Claude reads the whole inventory and finds things described differently."""
+        q = q.strip()
+        if len(q) < 2:
+            raise HTTPException(400, "Type what you're looking for first.")
+        items, _ = await catalogue(request)
+        res = await run_in_threadpool(claude_search, request.app.state.claude,
+                                      settings.search_model or settings.claude_model, q, items)
+        log.info("Claude search %r: %d matches, usage %s", q, len(res["matches"]), res["usage"])
+        return {"query": q, "results": group_by_box(res["matches"]), "note": res["note"]}
+
+    async def our_item(request: Request, item_id: str) -> dict:
+        try:
+            item = await hb(request).get_entity(item_id)
+        except HomeboxError:
+            raise HTTPException(404, "That item no longer exists in Homebox.")
+        parent = (item.get("parent") or {}).get("id")
+        if not parent or (item.get("entityType") or {}).get("isLocation"):
+            raise HTTPException(400, "That isn't an item in a box.")
+        await box_by_id(request, parent)  # checks the box is one of ours
+        return item
+
+    @app.put("/api/item/{item_id}")
+    async def edit_item(item_id: str, request: Request, name: str = Form(...), quantity: str = Form("1"),
+                        description: str = Form(""), tags: str = Form("")):
+        item = await our_item(request, item_id)
+        if not name.strip():
+            raise HTTPException(400, "The item needs a name.")
+        try:
+            qty = max(1.0, float(quantity))
+        except ValueError:
+            qty = 1.0
+        tag_names = [t.strip() for t in tags.split(",") if t.strip()]
+        tag_ids = await hb(request).ensure_tags(tag_names)
+        updated = await hb(request).update_entity(
+            item_id, item, name=name.strip()[:255], quantity=qty, description=description.strip()[:1000],
+            tagIds=list(dict.fromkeys(tag_ids[t] for t in tag_names)),
+        )
+        forget_catalogue()
+        return summarize(updated)
+
+    @app.delete("/api/item/{item_id}")
+    async def delete_item(item_id: str, request: Request):
+        item = await our_item(request, item_id)
+        await hb(request).delete_entity(item_id)
+        log.info("Deleted item %s (%s)", item["name"], item_id)
+        forget_catalogue()
+        return {"deleted": item_id}
+
+    @app.post("/api/locate")
+    async def locate(request: Request, box_ids: str = Form(...), photo: UploadFile = File(...)):
+        """Spot one or more boxes (comma-separated ids) in a wide photo of the storage area."""
+        ids = list(dict.fromkeys(i.strip() for i in box_ids.split(",") if i.strip()))
+        if not ids:
+            raise HTTPException(400, "Say which box to look for.")
+        if len(ids) > 12:
+            raise HTTPException(400, "Look for up to 12 boxes at a time.")
+        targets = []
+        for box_id in ids:
+            box = await box_by_id(request, box_id)
+            label = settings.parse_box_name(box["name"])
+            if label:
+                colour, number = label
+                targets.append((box, f"{colour.lower()} {number}" if colour else number))
+        if not targets:
+            raise HTTPException(400, "Boxes without a label can't be spotted in a photo.")
+        pics = await read_photos([photo])
+        if not pics:
+            raise HTTPException(400, "The photo was empty.")
+        res = await run_in_threadpool(locate_boxes, request.app.state.claude, settings.claude_model,
+                                      pics[0].content, [t for _, t in targets])
+        results = [{"boxId": box["id"], "boxName": box["name"], **r}
+                   for (box, _), r in zip(targets, res["results"])]
+        log.info("Located %s: %s", [t for _, t in targets], [(r["target"], r["found"]) for r in results])
+        return {"results": results, "seen": res["seen"]}
 
     @app.post("/api/analyze")
     async def analyze(request: Request, box_number: str = Form(""), colour: str = Form(""), box_id: str = Form(""),
@@ -301,6 +434,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             await client.append_notes(box_id, "\n".join(parts))
 
         log.info("Saved %s: %d items, %d photos", name, len(saved), len(pics))
+        forget_catalogue()
         return {"boxName": name, "boxId": box_id, "created": created, "itemsSaved": len(saved),
                 "photosSaved": len(pics), "link": box_link(box_id)}
 

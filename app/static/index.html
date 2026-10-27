@@ -10,13 +10,31 @@
 </head>
 <body>
 <header>
-  <h1>Box Inventory</h1>
+  <h1><a id="homeLink" href="#">Box Inventory</a></h1>
   <span id="boxBadge" class="badge" hidden></span>
 </header>
 
 <main>
+  <!-- 0. Home -->
+  <section id="stepHome" class="step">
+    <p class="home-intro" id="homeIntro">What would you like to do?</p>
+    <button id="goCreate" class="home-card" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z"/><path d="M3 7.5 12 12l9-4.5M12 12v9"/><path d="M17 15.5h4M19 13.5v4"/></svg>
+      <span><strong>Add a box</strong><small>Photograph it and say what's inside</small></span>
+    </button>
+    <button id="goAlter" class="home-card" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>
+      <span><strong>Change a box</strong><small>Add or edit items, or change its label</small></span>
+    </button>
+    <button id="goFind" class="home-card" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
+      <span><strong>Find something</strong><small>Search for an item or a box</small></span>
+    </button>
+  </section>
+
   <!-- 1. Pick a box -->
-  <section id="stepBox" class="step">
+  <section id="stepBox" class="step" hidden>
+    <h2 id="boxStepTitle" class="step-title">Add a box</h2>
     <div id="labellingNote" class="note" hidden></div>
     <label class="primary file-btn">
       <input id="labelPhoto" type="file" accept="image/*" capture="environment" hidden>
@@ -43,14 +61,57 @@
       <button id="labelLaterBtn" class="link-btn" type="button">Label an unlabelled box</button>
     </div>
     <button id="cancelLabelling" class="secondary" type="button" hidden>Cancel</button>
+    <button id="boxHome" class="secondary" type="button">Back</button>
   </section>
 
   <!-- 1b. Unlabelled boxes -->
   <section id="stepUnlabelled" class="step" hidden>
-    <h2>Unlabelled boxes</h2>
+    <h2 class="step-title">Unlabelled boxes</h2>
     <p class="hint">Pick the box you've just put a label on, or open one to add things.</p>
     <div id="unlabelledList"></div>
     <button id="backFromUnlabelled" class="secondary" type="button">Back</button>
+  </section>
+
+  <!-- Box page: what's in a box, and changing it -->
+  <section id="stepView" class="step" hidden>
+    <h2 id="viewTitle" class="step-title"></h2>
+    <p id="viewMeta" class="hint"></p>
+    <div id="viewItems"></div>
+    <button id="viewAdd" class="primary" type="button">Add items</button>
+    <label id="viewLocate" class="secondary file-btn">
+      <input id="locatePhoto" type="file" accept="image/*" capture="environment" hidden>
+      Find it in a photo
+    </label>
+    <div id="locateResult" class="locate-result" hidden>
+      <div class="locate-img"><img id="locateImg" alt="Your photo"><div id="locateMarks"></div></div>
+      <div id="locateText"></div>
+    </div>
+    <button id="viewLabel" class="secondary" type="button">Change label</button>
+    <button id="viewBack" class="secondary" type="button">Back</button>
+  </section>
+
+  <!-- Find -->
+  <section id="stepFind" class="step" hidden>
+    <h2 class="step-title">Find something</h2>
+    <form id="findForm" role="search">
+      <input id="findInput" type="search" placeholder="e.g. Christmas lights, or Red 47" enterkeyhint="search"
+             autocomplete="off" aria-label="Search for an item or box">
+    </form>
+    <p id="findHint" class="hint">Searches item names, details and box names, and forgives typos.
+      Can't find it? Tap <strong>Search by meaning</strong> and Claude looks for things stored under other words.</p>
+    <div id="findSummary" class="find-summary" hidden></div>
+    <label id="findLocate" class="secondary file-btn" hidden>
+      <input id="findLocatePhoto" type="file" accept="image/*" capture="environment" hidden>
+      <span id="findLocateLabel">Spot these boxes in a photo</span>
+    </label>
+    <div id="findLocateResult" class="locate-result" hidden>
+      <div class="locate-img"><img id="findLocateImg" alt="Your photo"><div id="findLocateMarks"></div></div>
+      <div id="findLocateText"></div>
+    </div>
+    <div id="findClaudeResults"></div>
+    <div id="findResults"></div>
+    <button id="findClaude" class="secondary" type="button" hidden>Search by meaning (Claude)</button>
+    <button id="findHome" class="secondary" type="button">Back</button>
   </section>
 
   <!-- 2. Photos and description -->
@@ -104,11 +165,34 @@
     <p><a id="doneLink" target="_blank" rel="noopener" hidden>Open in Homebox</a></p>
     <button id="nextBox" class="primary" type="button">Next box</button>
     <button id="sameBox" class="secondary" type="button">Add more to this box</button>
+    <button id="doneHome" class="link-btn" type="button">Home</button>
   </section>
 </main>
 
 <div id="busy" class="busy" hidden><div class="spinner"></div><p id="busyText">Working…</p></div>
 <div id="toast" class="toast" hidden></div>
+
+<template id="viewItemTpl">
+  <div class="vitem">
+    <button class="vitem-main" type="button">
+      <span class="vitem-name"></span><span class="vitem-qty"></span>
+      <span class="vitem-desc"></span><span class="vitem-tags"></span>
+    </button>
+    <div class="vitem-edit" hidden>
+      <div class="item-top">
+        <input class="name" placeholder="Item name" aria-label="Item name">
+        <input class="qty" type="number" min="1" inputmode="numeric" aria-label="Quantity">
+      </div>
+      <textarea class="desc" rows="2" placeholder="Details (colour, brand, condition…)" aria-label="Details"></textarea>
+      <input class="tags" placeholder="Tags, comma separated" aria-label="Tags">
+      <div class="row">
+        <button class="secondary del" type="button">Delete</button>
+        <button class="secondary cancel" type="button">Cancel</button>
+        <button class="primary save" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+</template>
 
 <template id="itemTpl">
   <div class="item">

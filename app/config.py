@@ -48,6 +48,8 @@ class Settings:
     # Claude
     claude_model: str = field(default_factory=lambda: os.environ.get("CLAUDE_MODEL", "claude-opus-5-5"))
     claude_effort: str = field(default_factory=lambda: os.environ.get("CLAUDE_EFFORT", "medium"))
+    # Model for "search by meaning". Empty = same as CLAUDE_MODEL. claude-haiku-5-5 is much cheaper.
+    search_model: str = field(default_factory=lambda: os.environ.get("SEARCH_MODEL", ""))
 
     # Optional password for this app's web page (strongly recommended if it is
     # reachable from outside your home network).
@@ -66,6 +68,19 @@ class Settings:
         """3 for "Unlabelled 003", None for anything that isn't an unlabelled box name."""
         m = re.fullmatch(re.escape(self.unlabelled_prefix) + r"\s+(\d+)", name.strip(), re.IGNORECASE)
         return int(m.group(1)) if m else None
+
+    def parse_box_name(self, name: str) -> tuple[str, str] | None:
+        """("Red", "45") for "Box Red 045", or None if the name isn't a labelled box."""
+        pattern = re.escape(self.box_name_format)
+        colours = "|".join(re.escape(n) for n, _ in self.box_colours) or "(?!)"
+        pattern = pattern.replace(r"\{colour\}", f"(?P<colour>{colours})?").replace(r"\{n\}", r"(?P<n>\S+)")
+        pattern = pattern.replace(r"\ ", r"\s*")
+        m = re.fullmatch(pattern, name.strip(), re.IGNORECASE)
+        if not m:
+            return None
+        number = m.group("n").lstrip("0") or "0" if m.group("n").isdigit() else m.group("n")
+        colour = next((n for n, _ in self.box_colours if n.lower() == (m.groupdict().get("colour") or "").lower()), "")
+        return colour, number
 
     def __post_init__(self):
         if len(self.box_colours) > 1 and "{colour}" not in self.box_name_format:

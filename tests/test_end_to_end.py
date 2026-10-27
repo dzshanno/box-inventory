@@ -15,7 +15,8 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app.analyze import LABEL_PROMPT
+from app.analyze import LABEL_PROMPT, LOCATE_PROMPT
+from app.search import SEARCH_PROMPT
 from app.config import Settings
 from app.homebox import Homebox
 from app.main import create_app
@@ -31,19 +32,27 @@ class FakeClaude:
     def __init__(self, items):
         self.items = items
         self.label = {"has_label": False, "colour": "other", "number": "", "confidence": "low", "note": ""}
+        self.locate = {"boxes": [], "seen": []}
+        self.search = lambda kwargs: {"matches": [], "note": "Nothing fits."}
         self.calls = []
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        if kwargs["system"] == LABEL_PROMPT:
+        system = kwargs["system"]
+        if isinstance(system, list) and system[0]["text"] == SEARCH_PROMPT:
+            out = self.search(kwargs)
+        elif system == LABEL_PROMPT:
             out = self.label
+        elif kwargs["system"] == LOCATE_PROMPT:
+            out = self.locate
         else:
             out = {"box_summary": "Winter clothes", "items": self.items, "questions": ["Is the red coat yours?"]}
         return SimpleNamespace(
             stop_reason="end_turn",
             content=[SimpleNamespace(type="text", text=json.dumps(out))],
-            usage=SimpleNamespace(input_tokens=1000, output_tokens=200),
+            usage=SimpleNamespace(input_tokens=1000, output_tokens=200, cache_read_input_tokens=0,
+                                  cache_creation_input_tokens=0),
         )
 
 
@@ -219,3 +228,116 @@ def test_unlabelled_boxes(setup):
 
     # Unknown ids are rejected
     assert client.get("/api/box-by-id/nope").status_code == 404
+
+
+def test_search_and_edit(setup):
+    client, _, _ = setup
+    save = lambda colour, n, items: client.post("/api/save", data={
+        "box_number": n, "colour": colour, "items": json.dumps(items)}).json()
+    red = save("Red", "47", [{"name": "Christmas lights", "quantity": 3, "tags": ["Christmas"]},
+                             {"name": "Tinsel", "description": "Gold and silver"}])
+    blue = save("Blue", "47", [{"name": "Fairy lights", "description": "Battery, for the garden"}])
+    save("Red", "3", [{"name": "Garden kneeler"}])
+
+    # Items are grouped by box; matches in descriptions count too
+    r = client.get("/api/search", params={"q": "lights"}).json()
+    assert {g["boxName"]: [i["name"] for i in g["items"]] for g in r["results"]} == {
+        "Box Red 047": ["Christmas lights"], "Box Blue 047": ["Fairy lights"]}
+    r = client.get("/api/search", params={"q": "garden"}).json()
+    assert sorted(g["boxName"] for g in r["results"]) == ["Box Blue 047", "Box Red 003"]
+    # Box names match too
+    r = client.get("/api/search", params={"q": "Blue 047"}).json()
+    assert r["results"][0]["boxName"] == "Box Blue 047" and r["results"][0]["boxMatches"]
+    assert client.get("/api/search", params={"q": "x"}).json()["results"] == []
+    assert client.get("/api/search", params={"q": "snorkel"}).json()["results"] == []
+
+    # Edit an item
+    lights = client.get("/api/box/47?colour=Red").json()["items"]
+    item = next(i for i in lights if i["name"] == "Christmas lights")
+    r = client.put(f"/api/item/{item['id']}", data={"name": "Christmas lights (outdoor)", "quantity": "4",
+                                                    "description": "Warm white", "tags": "Christmas, Outdoor"})
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "Christmas lights (outdoor)" and r.json()["quantity"] == 4
+    assert sorted(r.json()["tags"]) == ["Christmas", "Outdoor"]
+    assert client.put(f"/api/item/{item['id']}", data={"name": "  "}).status_code == 400
+
+    # Delete an item
+    tinsel = next(i for i in lights if i["name"] == "Tinsel")
+    assert client.delete(f"/api/item/{tinsel['id']}").status_code == 200
+    assert [i["name"] for i in client.get("/api/box/47?colour=Red").json()["items"]] == ["Christmas lights (outdoor)"]
+    assert client.delete(f"/api/item/{tinsel['id']}").status_code == 404
+
+    # Boxes can't be edited or deleted as if they were items
+    assert client.delete(f"/api/item/{red['boxId']}").status_code == 400
+    # Labelled boxes can be relabelled too
+    r = client.post(f"/api/box-by-id/{blue['boxId']}/label", data={"box_number": "48", "colour": "Blue"})
+    assert r.json()["boxName"] == "Box Blue 048"
+
+
+def test_locate(setup):
+    client, claude, _ = setup
+    red = client.post("/api/save", data={"box_number": "45", "colour": "Red", "items": "[]"}).json()
+    blue = client.post("/api/save", data={"box_number": "3", "colour": "Blue", "items": "[]"}).json()
+    photo = [("photo", ("room.jpg", jpeg(), "image/jpeg"))]  # 3000x2000, sent to Claude as 1568x1045
+
+    # Several boxes in one photo; one found, one not
+    claude.locate = {"boxes": [
+        {"target": "red 45", "found": True, "x1": 784, "y1": 209, "x2": 1176, "y2": 627,
+         "where": "centre stack, top", "confidence": "high"},
+        {"target": "blue 3", "found": False, "x1": 0, "y1": 0, "x2": 0, "y2": 0, "where": "", "confidence": "low"},
+    ], "seen": ["red 16", "red 45"]}
+    r = client.post("/api/locate", data={"box_ids": f"{red['boxId']},{blue['boxId']}"}, files=photo)
+    assert r.status_code == 200, r.text
+    res = r.json()
+    assert [(x["boxName"], x["found"]) for x in res["results"]] == [("Box Red 045", True), ("Box Blue 003", False)]
+    assert res["results"][0]["box"] == [0.5, 0.2, 0.75, 0.6] and res["results"][0]["where"] == "centre stack, top"
+    assert res["seen"] == ["red 16"]  # boxes we asked for aren't repeated
+    prompt = claude.calls[-1]["messages"][0]["content"][1]["text"]
+    assert "labelled: red 45, blue 3." in prompt
+
+    # Claude leaving a box out counts as not found
+    claude.locate = {"boxes": [], "seen": []}
+    r = client.post("/api/locate", data={"box_ids": red["boxId"]}, files=photo).json()
+    assert r["results"][0]["found"] is False and r["results"][0]["box"] is None
+
+    # An unlabelled box has nothing to look for
+    unl = client.post("/api/save", data={"items": "[]"}).json()
+    r = client.post("/api/locate", data={"box_ids": unl["boxId"]}, files=photo)
+    assert r.status_code == 400 and "without a label" in r.json()["detail"]
+
+
+def test_claude_search(setup):
+    client, claude, _ = setup
+    a = client.post("/api/save", data={"box_number": "47", "colour": "Red", "items": json.dumps(
+        [{"name": "Christmas lights", "quantity": 3}, {"name": "Cordless screwdriver", "description": "Bosch"}])}).json()
+    client.post("/api/save", data={"box_number": "12", "colour": "Blue", "items": json.dumps(
+        [{"name": "Fairy lights", "description": "garden"}])})
+
+    def answer(kwargs):
+        inventory = kwargs["system"][1]["text"]
+        assert kwargs["system"][1]["cache_control"] == {"type": "ephemeral"}
+        assert "My query" not in inventory  # the query goes in the message, not the cached part
+        ids = {line.split(" | ")[2].split(" x")[0]: line.split(" | ")[0] for line in inventory.splitlines()[1:]}
+        return {"matches": [
+            {"id": ids["Fairy lights"], "why": "same thing", "confidence": "high"},
+            {"id": ids["Christmas lights"], "why": "string lights", "confidence": "medium"},
+            {"id": "i999", "why": "made up", "confidence": "high"},  # unknown ids are dropped
+        ], "note": ""}
+    claude.search = answer
+    r = client.get("/api/search/claude", params={"q": "twinkly lights"})
+    assert r.status_code == 200, r.text
+    res = r.json()["results"]
+    assert [(g["boxName"], [i["name"] for i in g["items"]]) for g in res] == [
+        ("Box Blue 012", ["Fairy lights"]), ("Box Red 047", ["Christmas lights"])]
+    assert res[0]["items"][0]["why"] == "same thing"
+    assert "What I'm looking for: twinkly lights" in claude.calls[-1]["messages"][0]["content"]
+
+    # The quick search finds typos and half-typed words, across boxes
+    r = client.get("/api/search", params={"q": "ligh"}).json()
+    assert sorted(g["boxName"] for g in r["results"]) == ["Box Blue 012", "Box Red 047"]
+    assert client.get("/api/search", params={"q": "screwdriver bosh"}).json()["results"][0]["boxId"] == a["boxId"]
+
+    # The search list is refreshed after a change
+    client.post("/api/save", data={"box_number": "47", "colour": "Red", "items": '[{"name": "Snorkel"}]'})
+    assert client.get("/api/search", params={"q": "snorkel"}).json()["results"][0]["boxName"] == "Box Red 047"
+    assert client.get("/api/search/claude", params={"q": " "}).status_code == 400

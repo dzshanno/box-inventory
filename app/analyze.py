@@ -233,3 +233,91 @@ def read_label(client: anthropic.Anthropic, model: str, photo: bytes, colours: l
         "confidence": out.get("confidence", "low") if has_label else "low",
         "note": str(out.get("note") or ""),
     }
+
+
+LOCATE_PROMPT = """You help someone spot particular storage boxes in a photo of their storage area.
+
+Boxes carry bold number labels: printed strip labels or round number stickers. The label colour matters: \
+red 42 and blue 42 are different boxes. Find each of the boxes asked for.
+
+Rules:
+- Only mark a box found if you can read its label in the photo. Never point at a box you can't read.
+- The bounding box goes around the whole storage box, not just the label, in pixel coordinates of the image.
+- "where" is one short phrase a person can follow, e.g. "back-right shelf, bottom row, second from left".
+- Also list the other labels you could read, so they know which part of the room the photo shows."""
+
+
+def locate_boxes(client: anthropic.Anthropic, model: str, photo: bytes, targets: list[str]) -> dict:
+    """Find labelled boxes in a wide photo. targets are labels like "red 45".
+
+    Returns {"results": [{"target", "found", "box": [x1, y1, x2, y2] as fractions or None,
+    "where", "confidence"}], "seen": [...]} with one result per target, in order."""
+    media_type, b64 = prepare_image(photo)
+    width, height = Image.open(io.BytesIO(base64.b64decode(b64))).size
+    schema = {
+        "type": "object", "additionalProperties": False, "required": ["boxes", "seen"],
+        "properties": {
+            "boxes": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["target", "found", "x1", "y1", "x2", "y2", "where", "confidence"],
+                "properties": {
+                    "target": {"type": "string", "enum": targets},
+                    "found": {"type": "boolean"},
+                    "x1": {"type": "integer"}, "y1": {"type": "integer"},
+                    "x2": {"type": "integer"}, "y2": {"type": "integer"},
+                    "where": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                },
+            }},
+            "seen": {"type": "array", "items": {"type": "string"},
+                     "description": "Other box labels you could read, e.g. 'red 16'."},
+        },
+    }
+    wanted = ", ".join(targets)
+    try:
+        response = client.beta.messages.create(
+            model=model,
+            max_tokens=6000,
+            system=LOCATE_PROMPT,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                {"type": "text", "text": f"The image is {width}x{height} pixels. Find the boxes labelled: {wanted}. "
+                                         "Give one entry per box asked for; if one isn't visible, set found to false "
+                                         "and its coordinates to 0."},
+            ]}],
+            output_config={"effort": "medium", "format": {"type": "json_schema", "schema": schema}},
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+        )
+    except anthropic.APIStatusError as exc:
+        raise AnalysisError(f"Claude API error ({exc.status_code}): {exc.message}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise AnalysisError("Couldn't reach the Claude API. Check the server's internet connection.") from exc
+
+    text = next((b.text for b in response.content if b.type == "text"), None)
+    if response.stop_reason == "refusal" or not text:
+        raise AnalysisError("Claude couldn't look at this photo. Try another one.")
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AnalysisError("Claude returned something that wasn't valid JSON.") from exc
+
+    def frac(v, size):
+        return round(min(max(v / size, 0.0), 1.0), 4)
+
+    by_target = {}
+    for b in out.get("boxes", []):
+        box = None
+        if b.get("found"):
+            x1, x2 = sorted((frac(b["x1"], width), frac(b["x2"], width)))
+            y1, y2 = sorted((frac(b["y1"], height), frac(b["y2"], height)))
+            if x2 > x1 and y2 > y1:
+                box = [x1, y1, x2, y2]
+        if box or b.get("target") not in by_target:
+            by_target[b.get("target")] = {"found": box is not None, "box": box,
+                                          "where": str(b.get("where") or "") if box else "",
+                                          "confidence": b.get("confidence", "low") if box else "low"}
+    results = [{"target": t, **by_target.get(t, {"found": False, "box": None, "where": "", "confidence": "low"})}
+               for t in targets]
+    found = {t.lower() for t in targets}
+    return {"results": results, "seen": [str(x) for x in out.get("seen") or [] if str(x).lower() not in found]}

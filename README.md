@@ -12,6 +12,12 @@ In Homebox, each box becomes a location (for example `Storage Unit › Box Red 0
 
 **No label yet?** Tap **This box has no label yet** (or it's offered when Claude finds no label). The box is saved as `Unlabelled 001`, `Unlabelled 002` and so on. Once you've stuck a label on, tap **Label an unlabelled box**, pick it from the list (it shows what's inside), and photograph or type the new label. The box is renamed and keeps everything in it. You can't give a box a label that another box already has.
 
+## The home screen
+
+- **Add a box**: the steps above.
+- **Change a box**: photograph or type a label (or pick an unlabelled box) to see what's in it. Tap an item to fix its name, quantity, details or tags, or delete it. **Add items** adds more, and **Change label** renames the box.
+- **Find something**: type what you're after. Matches show as you type, and typos, plurals and half-typed words are fine ("chrismas lite", "drils"). Box names work too ("red 47"). If nothing uses your words, Claude reads the whole inventory and finds things stored under other words: "the christmas decorations" finds baubles, tinsel and a nativity set across several boxes. You can also tap **Search by meaning** yourself. When the results are in several boxes, **Spot these boxes in a photo** highlights each one in a wide photo of the lockup.
+
 Opening a box that already exists shows what's recorded. Claude is told about those items and only suggests new ones, so you can add to a box later.
 
 Works with **Homebox v0.27 or later**, which uses the "entities" and "tags" API.
@@ -64,7 +70,7 @@ Nothing is exposed to the public internet, and you get a valid certificate. If y
 
 ## Cost
 
-Each box is one Claude request (`claude-opus-5-5` by default), plus a small one when you photograph the label. With a few photos that's typically a few cents, so all 120 boxes come to a few dollars. `CLAUDE_EFFORT=low` is cheaper and faster, and `high` is more thorough. The server log records the token count for each box.
+Each box is one Claude request (`claude-opus-5-5` by default), plus a small one when you photograph the label. A search by meaning sends the whole inventory list to Claude; it's cached for 5 minutes, so the first search costs a few cents for a full lockup and the next ones well under a cent. Set `SEARCH_MODEL=claude-haiku-5-5` to make searches much cheaper. Typing in the search box never calls Claude. With a few photos that's typically a few cents, so all 120 boxes come to a few dollars. `CLAUDE_EFFORT=low` is cheaper and faster, and `high` is more thorough. The server log records the token count for each box.
 
 ## Settings
 
@@ -80,6 +86,7 @@ All settings go in `.env`. See `.env.example` for the full list. The main ones:
 | `SAVE_TRANSCRIPT` | `true` | Store your spoken description in the box's notes. |
 | `HOMEBOX_PUBLIC_URL` | (empty) | Adds an "Open in Homebox" link after saving. |
 | `CLAUDE_EFFORT` | `medium` | `low`, `medium` or `high`. |
+| `SEARCH_MODEL` | (empty) | Model for search by meaning. Empty uses `CLAUDE_MODEL`. |
 
 ## Development
 
@@ -96,7 +103,8 @@ HOMEBOX_TEST_URL=http://localhost:7745 HOMEBOX_TEST_API_KEY=hb_... pytest
 
 Code layout:
 
-- `app/main.py`: web routes (`/api/box/{n}`, `/api/read-label`, `/api/unlabelled`, `/api/analyze`, `/api/save`)
+- `app/main.py`: web routes (boxes, labels, items, search, photo finder, analyse and save)
+- `app/search.py`: quick word matching and Claude search
 - `app/analyze.py`: the Claude prompts (label reading and inventory) and output formats
 - `app/homebox.py`: Homebox API client
 - `app/static/`: the phone page

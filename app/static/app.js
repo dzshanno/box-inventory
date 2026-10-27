@@ -6,7 +6,9 @@ const state = {
   colour: "",       // label colour ("" when the app isn't set up with colours)
   boxId: null,      // Homebox id, used for boxes without a label
   labelPhoto: null, // {blob, url} from "Photograph the label", added to the box's photos
-  labelling: null,  // {id, boxName} while giving an unlabelled box its label
+  labelling: null,  // {id, boxName} while giving a box a (new) label
+  mode: "create",   // "create" (Add a box) or "alter" (Change a box)
+  viewBack: "stepHome", // where Back on the box page goes
   boxInfo: null,    // response from /api/box
   photos: [],       // [{blob, url}]
   draft: null,      // response from /api/analyze
@@ -14,14 +16,36 @@ const state = {
 const PHOTO_EDGE = 2000; // resize before upload: plenty for Homebox, much faster on mobile data
 
 // ---------- helpers ----------
-function show(step) {
+let currentStep = "stepHome";
+function show(step, push = true) {
   for (const s of document.querySelectorAll(".step")) s.hidden = s.id !== step;
+  if (step === "stepHome" || step === "stepFind") $("boxBadge").hidden = true;
+  if (push && step !== currentStep) history.pushState({ step }, "");
+  currentStep = step;
   window.scrollTo(0, 0);
+}
+window.addEventListener("popstate", (e) => {
+  stopMic();
+  const step = e.state?.step || "stepHome";
+  // Don't step back into a half-finished save; go home instead.
+  show(["stepReview", "stepCapture"].includes(step) && currentStep === "stepDone" ? "stepHome" : step, false);
+});
+function goHome() { stopMic(); if (state.labelling) setLabellingMode(false); show("stepHome"); }
+function setMode(mode) {
+  state.mode = mode;
+  const alter = mode === "alter";
+  $("boxStepTitle").textContent = alter ? "Change a box" : "Add a box";
+  $("noLabelBtn").hidden = alter;
+  $("labelLaterBtn").textContent = alter ? "Pick an unlabelled box" : "Label an unlabelled box";
+  $("startBtn").textContent = alter ? "Open" : "Start";
+  $("boxNumber").value = "";
+  resetLabelResult();
+  show("stepBox");
 }
 function busy(text) { $("busyText").textContent = text || "Working…"; $("busy").hidden = !text; }
 let toastTimer;
-function toast(msg) {
-  const t = $("toast"); t.textContent = msg; t.hidden = false;
+function toast(msg, error = false) {
+  const t = $("toast"); t.textContent = msg; t.hidden = false; t.classList.toggle("error", error);
   clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.hidden = true), 6000);
 }
 async function api(path, opts = {}) {
@@ -76,22 +100,29 @@ async function startBox(number) {
   busy("Checking Homebox…");
   let info;
   try { info = await api(`/api/box/${encodeURIComponent(number)}${boxQuery()}`); }
-  catch (e) { busy(); toast(e.message); return; }
+  catch (e) { busy(); toast(e.message, true); return; }
   busy();
+  if (state.mode === "alter") {
+    if (!info.exists) { toast(`${info.boxName} isn't in Homebox yet. Use “Add a box” to add it.`); return; }
+    state.box = number; state.boxId = null;
+    resetLabelResult();
+    openView(info, "stepBox");
+    return;
+  }
   state.box = number; state.boxId = null;
   store("last-box", { number, colour: state.colour });
   openBox(info);
 }
 
 // Open a box we know by its Homebox id (boxes without a label)
-async function startBoxById(id) {
+async function startBoxById(id, toView = false, back = "stepHome") {
   busy("Checking Homebox…");
   let info;
   try { info = await api(`/api/box-by-id/${encodeURIComponent(id)}`); }
-  catch (e) { busy(); toast(e.message); return; }
+  catch (e) { busy(); toast(e.message, true); return; }
   busy();
   state.box = ""; state.boxId = id;
-  openBox(info);
+  if (toView) openView(info, back); else openBox(info);
 }
 
 function startUnlabelled() {
@@ -144,7 +175,7 @@ async function readLabel(file) {
   busy("Reading the label…");
   let res;
   try { res = await api("/api/read-label", { method: "POST", body: fd }); }
-  catch (e) { busy(); toast(e.message); return; }
+  catch (e) { busy(); toast(e.message, true); return; }
   busy();
   state.labelPhoto = { blob, url: URL.createObjectURL(blob) };
   $("labelThumb").src = state.labelPhoto.url;
@@ -157,18 +188,19 @@ async function readLabel(file) {
     const name = box ? box.boxName : [label.colour, label.number].filter(Boolean).join(" ");
     let text = `<strong>${escapeHtml(name)}</strong>`;
     if (!state.labelling) {
-      text += box && box.exists ? ` · already has ${box.items.length} item(s)` : box ? " · new box" : "";
+      const none = state.mode === "alter" ? " · not in Homebox yet" : " · new box";
+      text += box && box.exists ? ` · ${box.items.length} item(s)` : box ? none : "";
     }
     $("labelText").innerHTML = text;
     const checks = [];
     if (needsColour() && !label.colour) checks.push("Couldn't tell the label colour. Pick it below.");
     else if (label.confidence !== "high") checks.push("Not sure about this. Check the colour and number below.");
     if (label.note) checks.push(label.note);
-    $("labelNote").textContent = checks.join(" ") || (state.labelling ? "Tap Save label if that's right." : "Tap Start if that's right.");
+    $("labelNote").textContent = checks.join(" ") || `Tap ${$("startBtn").textContent} if that's right.`;
   } else {
     $("labelText").innerHTML = "<strong>No label found</strong>";
     $("labelNote").textContent = label.note || "";
-    $("unlabelledBtn").hidden = !!state.labelling;
+    $("unlabelledBtn").hidden = !!state.labelling || state.mode === "alter";
   }
   panel.hidden = false;
 }
@@ -178,7 +210,7 @@ async function showUnlabelled() {
   busy("Loading…");
   let res;
   try { res = await api("/api/unlabelled"); }
-  catch (e) { busy(); toast(e.message); return; }
+  catch (e) { busy(); toast(e.message, true); return; }
   busy();
   const list = $("unlabelledList");
   list.innerHTML = res.boxes.length ? "" : '<p class="hint">No unlabelled boxes. Everything has a label.</p>';
@@ -192,7 +224,7 @@ async function showUnlabelled() {
       ? b.items.join(", ") + (b.itemCount > b.items.length ? ` and ${b.itemCount - b.items.length} more` : "")
       : "No items yet";
     const [open, label] = div.querySelectorAll("button");
-    open.onclick = () => startBoxById(b.id);
+    open.onclick = () => startBoxById(b.id, true, "stepUnlabelled");
     label.onclick = () => startLabelling(b);
     list.appendChild(div);
   }
@@ -200,7 +232,9 @@ async function showUnlabelled() {
 }
 function startLabelling(b) {
   state.labelling = { id: b.id, boxName: b.boxName };
-  $("labellingNote").innerHTML = `Giving <strong>${escapeHtml(b.boxName)}</strong> its label. Photograph the new label or type it in.`;
+  $("labellingNote").innerHTML = b.unlabelled === false
+    ? `New label for <strong>${escapeHtml(b.boxName)}</strong>. Photograph the new label or type it in.`
+    : `Giving <strong>${escapeHtml(b.boxName)}</strong> its label. Photograph the new label or type it in.`;
   setLabellingMode(true);
   show("stepBox");
 }
@@ -209,7 +243,7 @@ function setLabellingMode(on) {
   $("labellingNote").hidden = !on;
   $("otherActions").hidden = on;
   $("cancelLabelling").hidden = !on;
-  $("startBtn").textContent = on ? "Save label" : "Start";
+  $("startBtn").textContent = on ? "Save label" : state.mode === "alter" ? "Open" : "Start";
   $("boxNumber").value = "";
   resetLabelResult();
   $("boxBadge").hidden = true;
@@ -221,16 +255,22 @@ async function saveLabel(number) {
   busy("Saving the label…");
   let info;
   try { info = await api(`/api/box-by-id/${encodeURIComponent(state.labelling.id)}/label`, { method: "POST", body: fd }); }
-  catch (e) { busy(); toast(e.message); return; }
+  catch (e) { busy(); toast(e.message, true); return; }
   busy();
   const old = state.labelling.boxName;
   forget(`box-draft-${state.labelling.id}`);
   const photo = state.labelPhoto; state.labelPhoto = null;
   setLabellingMode(false);
   toast(`${old} is now ${info.boxName}.`);
-  state.box = number; state.boxId = null; state.labelPhoto = photo;
+  state.box = number; state.boxId = null;
   store("last-box", { number, colour: state.colour });
-  openBox(info);
+  if (state.mode === "alter") {
+    if (photo) URL.revokeObjectURL(photo.url);
+    openView(info, "stepHome");
+  } else {
+    state.labelPhoto = photo;
+    openBox(info);
+  }
 }
 
 // ---------- step 2: photos ----------
@@ -342,7 +382,7 @@ async function analyse() {
   busy("Claude is building the inventory… (usually under a minute)");
   try {
     state.draft = await api("/api/analyze", { method: "POST", body: fd });
-  } catch (e) { busy(); toast(e.message); return; }
+  } catch (e) { busy(); toast(e.message, true); return; }
   busy();
   renderReview();
   saveDraft();
@@ -400,7 +440,7 @@ async function save() {
   busy("Saving to Homebox…");
   let res;
   try { res = await api("/api/save", { method: "POST", body: fd }); }
-  catch (e) { busy(); toast(e.message); return; }
+  catch (e) { busy(); toast(e.message, true); return; }
   busy();
   forget(draftKey());
   if (!state.box) state.boxId = res.boxId; // a new box without a label is now known by its id
@@ -410,6 +450,216 @@ async function save() {
   if (res.link) { link.href = res.link; link.hidden = false; } else link.hidden = true;
   $("nextBox").textContent = nextNumber() ? `Next box (${nextNumber()})` : "Next box";
   show("stepDone");
+}
+
+// ---------- box page ----------
+function openView(info, back) {
+  state.boxInfo = info;
+  state.boxId = info.unlabelled ? info.id : state.boxId;
+  state.viewBack = back || "stepHome";
+  $("boxBadge").textContent = info.boxName;
+  $("boxBadge").hidden = false;
+  $("viewTitle").textContent = info.boxName;
+  renderViewMeta();
+  $("viewItems").innerHTML = "";
+  info.items.forEach(addViewItem);
+  if (!info.items.length) $("viewItems").innerHTML = '<p class="hint">No items recorded yet.</p>';
+  $("viewLocate").hidden = !!info.unlabelled;
+  $("locateResult").hidden = true;
+  $("viewLabel").textContent = info.unlabelled ? "Give it a label" : "Change label";
+  show("stepView");
+}
+function renderViewMeta() {
+  const info = state.boxInfo;
+  const bits = [`${info.items.length} item(s)`, `${info.photoCount} photo(s)`];
+  $("viewMeta").innerHTML = escapeHtml(bits.join(" · ")) +
+    (info.link ? ` · <a href="${escapeHtml(info.link)}" target="_blank" rel="noopener">Open in Homebox</a>` : "");
+}
+function addViewItem(item) {
+  const node = $("viewItemTpl").content.firstElementChild.cloneNode(true);
+  const fill = () => {
+    node.querySelector(".vitem-name").textContent = item.name;
+    node.querySelector(".vitem-qty").textContent = `×${item.quantity}`;
+    node.querySelector(".vitem-desc").textContent = item.description || "";
+    node.querySelector(".vitem-tags").textContent = (item.tags || []).join(", ");
+  };
+  const edit = node.querySelector(".vitem-edit");
+  const open = (on) => {
+    edit.hidden = !on; node.querySelector(".vitem-main").hidden = on;
+    if (on) {
+      edit.querySelector(".name").value = item.name;
+      edit.querySelector(".qty").value = item.quantity;
+      edit.querySelector(".desc").value = item.description || "";
+      edit.querySelector(".tags").value = (item.tags || []).join(", ");
+      edit.querySelector(".name").focus();
+    }
+  };
+  node.querySelector(".vitem-main").onclick = () => open(true);
+  edit.querySelector(".cancel").onclick = () => open(false);
+  edit.querySelector(".save").onclick = async () => {
+    const fd = new FormData();
+    fd.append("name", edit.querySelector(".name").value.trim());
+    fd.append("quantity", edit.querySelector(".qty").value || "1");
+    fd.append("description", edit.querySelector(".desc").value.trim());
+    fd.append("tags", edit.querySelector(".tags").value);
+    busy("Saving…");
+    try { Object.assign(item, await api(`/api/item/${encodeURIComponent(item.id)}`, { method: "PUT", body: fd })); }
+    catch (e) { busy(); toast(e.message, true); return; }
+    busy(); fill(); open(false);
+  };
+  edit.querySelector(".del").onclick = async () => {
+    if (!confirm(`Delete “${item.name}” from ${state.boxInfo.boxName}?`)) return;
+    busy("Deleting…");
+    try { await api(`/api/item/${encodeURIComponent(item.id)}`, { method: "DELETE" }); }
+    catch (e) { busy(); toast(e.message, true); return; }
+    busy();
+    node.remove();
+    state.boxInfo.items = state.boxInfo.items.filter((i) => i.id !== item.id);
+    renderViewMeta();
+    toast(`Deleted ${item.name}.`);
+  };
+  fill();
+  $("viewItems").appendChild(node);
+}
+
+// ---------- find it in a photo ----------
+// boxes: [{id, boxName}]. ids: the img, marks, text and result elements to fill.
+async function locate(file, boxes, ids) {
+  const blob = await resizePhoto(file);
+  const fd = new FormData();
+  fd.append("box_ids", boxes.map((b) => b.id).join(","));
+  fd.append("photo", blob, "room.jpg");
+  busy(boxes.length === 1 ? `Looking for ${boxes[0].boxName}…` : `Looking for ${boxes.length} boxes…`);
+  let res;
+  try { res = await api("/api/locate", { method: "POST", body: fd }); }
+  catch (e) { busy(); toast(e.message, true); return; }
+  busy();
+  const img = $(ids.img);
+  if (img.src) URL.revokeObjectURL(img.src);
+  img.src = URL.createObjectURL(blob);
+  const marks = $(ids.marks);
+  marks.innerHTML = "";
+  const found = res.results.filter((r) => r.found), missing = res.results.filter((r) => !r.found);
+  for (const r of found) {
+    const [x1, y1, x2, y2] = r.box;
+    const m = document.createElement("div");
+    m.className = "locate-mark" + (r.confidence === "high" ? "" : " unsure");
+    Object.assign(m.style, { left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%` });
+    m.innerHTML = "<span></span>";
+    m.firstChild.textContent = r.boxName.replace(/^Box\s+/i, "");
+    marks.appendChild(m);
+  }
+  let html = "";
+  if (found.length) {
+    html += "<ul>" + found.map((r) => `<li><strong>${escapeHtml(r.boxName)}:</strong> ${escapeHtml(r.where)}` +
+      (r.confidence === "high" ? "" : " <em>(not certain, check the label)</em>") + "</li>").join("") + "</ul>";
+  }
+  if (missing.length) {
+    html += `<p><strong>Not in this photo:</strong> ${escapeHtml(missing.map((r) => r.boxName).join(", "))}.</p>`;
+  }
+  if (!found.length) {
+    html += `<p>${res.seen.length ? `Labels I could read: ${escapeHtml(res.seen.join(", "))}.` : "Try a closer photo of where it might be."}</p>`;
+  }
+  $(ids.text).innerHTML = html;
+  $(ids.result).hidden = false;
+  $(ids.result).scrollIntoView({ behavior: "smooth", block: "start" });
+}
+const VIEW_LOCATE = { img: "locateImg", marks: "locateMarks", text: "locateText", result: "locateResult" };
+const FIND_LOCATE = { img: "findLocateImg", marks: "findLocateMarks", text: "findLocateText", result: "findLocateResult" };
+
+// ---------- find ----------
+let findTimer, findSeq = 0;
+const findState = { quick: [], claude: null }; // result groups shown
+function highlight(text, q) {
+  // Mark the query words that appear in the text (exact substrings only; fuzzy matches stay unmarked)
+  let out = escapeHtml(text);
+  const skip = new Set(["the", "and", "for", "some", "my", "our", "of", "in", "a", "an", "box", "boxes", "with"]);
+  for (const w of q.toLowerCase().split(/\s+/).filter((w) => w.length >= 2 && !skip.has(w))) {
+    const safe = escapeHtml(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`(${safe})(?![^<]*>)`, "ig"), "<mark>$1</mark>");
+  }
+  return out;
+}
+function resultCard(g, q, withWhy) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "result";
+  const items = g.items.slice(0, 6).map((i) => `<li class="${withWhy && i.confidence === "low" ? "unsure" : ""}">` +
+    `${highlight(i.name, q)} ×${i.quantity}${i.description ? ` · ${highlight(i.description, q)}` : ""}` +
+    (withWhy && i.why ? ` <span class="why">— ${escapeHtml(i.why)}</span>` : "") + "</li>").join("");
+  const more = g.items.length > 6 ? `<li>…and ${g.items.length - 6} more</li>` : "";
+  b.innerHTML = `<strong>${highlight(g.boxName, q)}</strong>${items || more ? `<ul>${items}${more}</ul>` : ""}`;
+  b.onclick = () => startBoxById(g.boxId, true, "stepFind");
+  return b;
+}
+function renderFind() {
+  const q = $("findInput").value.trim();
+  const claudeGroups = findState.claude?.results || [];
+  const claudeIds = new Set(claudeGroups.flatMap((g) => g.items.map((i) => i.id)));
+  // Word matches not already shown under Claude's matches
+  const quick = findState.quick
+    .map((g) => ({ ...g, items: g.items.filter((i) => !claudeIds.has(i.id)) }))
+    .filter((g) => g.items.length || (g.boxMatches && !claudeGroups.some((c) => c.boxId === g.boxId)));
+
+  const cOut = $("findClaudeResults");
+  cOut.innerHTML = "";
+  if (findState.claude) {
+    cOut.insertAdjacentHTML("beforeend", '<p class="section-title">Matches by meaning</p>');
+    if (!claudeGroups.length) cOut.insertAdjacentHTML("beforeend", `<p class="hint">${escapeHtml(findState.claude.note || "Claude didn't find anything that fits.")}</p>`);
+    claudeGroups.forEach((g) => cOut.appendChild(resultCard(g, q, true)));
+  }
+  const out = $("findResults");
+  out.innerHTML = "";
+  if (quick.length) {
+    if (findState.claude) out.insertAdjacentHTML("beforeend", '<p class="section-title">Matching your words</p>');
+    quick.forEach((g) => out.appendChild(resultCard(g, q, false)));
+  } else if (!findState.claude && q.length >= 2) {
+    out.innerHTML = `<p class="hint">No item uses those words. Try <strong>Search by meaning</strong>.</p>`;
+  }
+
+  // Summary + "spot these boxes". After a Claude search, that's the boxes it's confident about.
+  const boxes = new Map();
+  const confident = claudeGroups.filter((g) => g.items.some((i) => i.confidence !== "low"));
+  (findState.claude ? confident : quick).forEach((g) => boxes.set(g.boxId, g));
+  const labelled = [...boxes.values()].filter((g) => !g.unlabelled).slice(0, 12);
+  $("findSummary").hidden = !boxes.size;
+  const names = [...boxes.values()].map((g) => g.boxName);
+  $("findSummary").textContent = names.length <= 4
+    ? `In ${names.length > 1 ? names.slice(0, -1).join(", ") + " and " + names.at(-1) : names[0]}`
+    : `In ${names.length} boxes`;
+  $("findLocate").hidden = !labelled.length;
+  $("findLocateLabel").textContent = labelled.length === 1 ? `Spot ${labelled[0].boxName} in a photo` :
+    `Spot these ${labelled.length} boxes in a photo`;
+  findState.locateBoxes = labelled.map((g) => ({ id: g.boxId, boxName: g.boxName }));
+  $("findClaude").hidden = q.length < 2 || !!findState.claude;
+  $("findHint").hidden = q.length >= 2;
+}
+async function runSearch() {
+  const q = $("findInput").value.trim();
+  const seq = ++findSeq;
+  findState.claude = null;
+  $("findLocateResult").hidden = true;
+  if (q.length < 2) findState.quick = [];
+  renderFind(); // clear any previous Claude answer straight away
+  if (q.length < 2) return;
+  let res;
+  try { res = await api(`/api/search?q=${encodeURIComponent(q)}`); }
+  catch (e) { toast(e.message, true); return; }
+  if (seq !== findSeq) return; // a newer search is on its way
+  findState.quick = res.results;
+  renderFind();
+}
+async function runClaudeSearch() {
+  const q = $("findInput").value.trim();
+  if (q.length < 2) return;
+  const seq = findSeq;
+  busy("Claude is looking through everything…");
+  let res;
+  try { res = await api(`/api/search/claude?q=${encodeURIComponent(q)}`); }
+  catch (e) { busy(); toast(e.message, true); return; }
+  busy();
+  if (seq !== findSeq) return;
+  findState.claude = res;
+  renderFind();
 }
 
 // ---------- wiring ----------
@@ -422,7 +672,39 @@ $("unlabelledBtn").onclick = startUnlabelled;
 $("noLabelBtn").onclick = startUnlabelled;
 $("labelLaterBtn").onclick = showUnlabelled;
 $("backFromUnlabelled").onclick = () => show("stepBox");
-$("cancelLabelling").onclick = () => { setLabellingMode(false); showUnlabelled(); };
+$("cancelLabelling").onclick = () => {
+  const back = state.mode === "alter" && state.boxInfo?.exists ? state.boxInfo : null;
+  setLabellingMode(false);
+  if (back) openView(back, state.viewBack); else showUnlabelled();
+};
+$("homeLink").onclick = (e) => { e.preventDefault(); goHome(); };
+$("goCreate").onclick = () => setMode("create");
+$("goAlter").onclick = () => setMode("alter");
+$("goFind").onclick = () => { show("stepFind"); $("findInput").focus(); };
+$("boxHome").onclick = goHome;
+$("findHome").onclick = goHome;
+$("doneHome").onclick = goHome;
+$("findInput").addEventListener("input", () => { clearTimeout(findTimer); findTimer = setTimeout(runSearch, 300); });
+$("findForm").onsubmit = async (e) => {
+  e.preventDefault(); clearTimeout(findTimer); $("findInput").blur();
+  await runSearch();
+  if (!findState.quick.length) runClaudeSearch(); // nothing uses those words: ask Claude straight away
+};
+$("findClaude").onclick = runClaudeSearch;
+$("findLocatePhoto").onchange = (e) => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (f) locate(f, findState.locateBoxes, FIND_LOCATE);
+};
+$("viewBack").onclick = () => show(state.viewBack);
+$("viewAdd").onclick = () => { state.mode = "create"; openBox(state.boxInfo); };
+$("viewLabel").onclick = () => {
+  state.mode = "alter";
+  startLabelling({ id: state.boxInfo.id, boxName: state.boxInfo.boxName, unlabelled: state.boxInfo.unlabelled });
+};
+$("locatePhoto").onchange = (e) => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (f) locate(f, [{ id: state.boxInfo.id, boxName: state.boxInfo.boxName }], VIEW_LOCATE);
+};
 $("boxNumber").addEventListener("keydown", (e) => { if (e.key === "Enter") startBox($("boxNumber").value); });
 $("photoInput").onchange = (e) => { addPhotos([...e.target.files]); e.target.value = ""; };
 $("photoPick").onchange = (e) => { addPhotos([...e.target.files]); e.target.value = ""; };
@@ -433,9 +715,10 @@ $("backToCapture").onclick = () => show("stepCapture");
 $("addItem").onclick = () => addItemCard({}).querySelector(".name").focus();
 $("saveBtn").onclick = save;
 $("nextBox").onclick = () => { $("boxNumber").value = nextNumber(); $("boxBadge").hidden = true; resetLabelResult(); show("stepBox"); };
-$("sameBox").onclick = () => (state.boxId ? startBoxById(state.boxId) : startBox(state.box));
+$("sameBox").onclick = () => { state.mode = "create"; state.boxId ? startBoxById(state.boxId) : startBox(state.box); };
 
 (async function init() {
+  history.replaceState({ step: "stepHome" }, "");
   setupMic();
   let last = load("last-box");
   if (typeof last === "string") last = { number: last, colour: "" }; // saved by an older version
@@ -449,5 +732,5 @@ $("sameBox").onclick = () => (state.boxId ? startBoxById(state.boxId) : startBox
     if (window.APP_CONFIG.parentLocation) {
       $("boxHint").textContent += `${last ? " · " : ""}Boxes are saved in “${window.APP_CONFIG.parentLocation}”.`;
     }
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message, true); }
 })();

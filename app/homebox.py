@@ -206,6 +206,20 @@ class Homebox:
                 return found
             page_no += 1
 
+    async def search(self, query: str, limit: int = 300) -> list[dict]:
+        """Entities (items and locations) matching `query`, as Homebox's search finds them."""
+        found, page_no = [], 1
+        while len(found) < limit:
+            page = await self._get("/entities", q=query, pageSize=100, page=page_no)
+            found.extend(page.get("items", []))
+            if page_no * 100 >= page.get("total", 0) or not page.get("items"):
+                break
+            page_no += 1
+        return found[:limit]
+
+    async def delete_entity(self, entity_id: str) -> None:
+        await self._request("DELETE", f"/entities/{entity_id}")
+
     async def add_photo(self, entity_id: str, photo: Photo, primary: bool = False) -> None:
         await self._request(
             "POST", f"/entities/{entity_id}/attachments",
