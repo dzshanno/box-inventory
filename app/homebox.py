@@ -45,6 +45,7 @@ class Homebox:
         self._token: str | None = None
         self._lock = asyncio.Lock()
         self._types: dict[str, str] | None = None
+        self._base_url = base_url
         self._client = httpx.AsyncClient(base_url=f"{base_url}/api/v1", timeout=60, transport=transport)
 
     async def close(self) -> None:
@@ -61,8 +62,16 @@ class Homebox:
                 await self._login()
             return self._token  # type: ignore[return-value]
 
+    async def _send(self, method: str, path: str, **kwargs) -> httpx.Response:
+        try:
+            return await self._client.request(method, path, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise HomeboxError(f"Homebox at {self._base_url} took too long to answer.") from exc
+        except httpx.RequestError as exc:
+            raise HomeboxError(f"Couldn't reach Homebox at {self._base_url}. Is it running, and is HOMEBOX_URL right?") from exc
+
     async def _login(self) -> None:
-        r = await self._client.post("/users/login", json={
+        r = await self._send("POST", "/users/login", json={
             "username": self._username, "password": self._password, "stayLoggedIn": True,
         })
         if r.status_code != 200:
@@ -72,7 +81,7 @@ class Homebox:
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         for attempt in range(2):
             headers = {"Authorization": await self._auth_header()}
-            r = await self._client.request(method, path, headers=headers, **kwargs)
+            r = await self._send(method, path, headers=headers, **kwargs)
             if r.status_code == 401 and not self._api_key and attempt == 0:
                 self._token = None  # session expired; log in again once
                 continue

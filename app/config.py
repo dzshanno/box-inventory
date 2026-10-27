@@ -43,7 +43,8 @@ class Settings:
     def box_name(self, number: str) -> str:
         number = number.strip()
         if number.isdigit():
-            number = number.zfill(self.box_number_digits)
+            # "42", "042" and "0042" are all the same box
+            number = str(int(number)).zfill(self.box_number_digits)
         return self.box_name_format.format(n=number)
 
 

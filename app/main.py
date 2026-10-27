@@ -159,9 +159,9 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
                    photos: list[UploadFile] = File(default=[])):
         try:
             item_list = json.loads(items)
-            assert isinstance(item_list, list)
+            assert isinstance(item_list, list) and all(isinstance(i, dict) for i in item_list)
         except Exception:
-            raise HTTPException(400, "items must be a JSON list")
+            raise HTTPException(400, "items must be a JSON list of objects")
         item_list = [i for i in item_list if str(i.get("name", "")).strip()]
         pics = await read_photos(photos)
         client = hb(request)
