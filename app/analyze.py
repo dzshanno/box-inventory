@@ -158,3 +158,78 @@ def analyze_box(client: anthropic.Anthropic, model: str, effort: str, box_name: 
         "output_tokens": response.usage.output_tokens,
     }
     return draft
+
+
+LABEL_PROMPT = """You read the number label on a storage box from a photo, so the right box can be opened.
+
+Labels are bold numbers: printed strip labels or round number stickers. The label colour is part of the \
+box's identity (red 42 and blue 42 are different boxes). The label colour is the colour of the sticker or \
+tape; if the tape is white or clear, it's the colour of the printed number.
+
+Rules:
+- Only report a number you can actually read on a label. Don't guess from anything else.
+- If several labelled boxes are visible, report the one the photo is centred on or closest to the camera.
+- If there is no label, or you can't read it, set has_label to false (or confidence to "low" with a note).
+- Keep the note to one short sentence, written to the person holding the phone. Leave it empty if all is clear."""
+
+
+def read_label(client: anthropic.Anthropic, model: str, photo: bytes, colours: list[str]) -> dict:
+    """Read a box's label colour and number from a photo.
+
+    Returns {"has_label", "colour", "number", "confidence", "note"}. colour is one of
+    `colours` or "" when it isn't one of them (or no colours are configured)."""
+    media_type, b64 = prepare_image(photo)
+    other = "other"
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["has_label", "colour", "number", "confidence", "note"],
+        "properties": {
+            "has_label": {"type": "boolean"},
+            "colour": {"type": "string", "enum": [*colours, other] if colours else [other]},
+            "number": {"type": "string", "description": "Digits as printed, or empty if unreadable."},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "note": {"type": "string", "description": "Short note for the user if anything is unclear, else empty."},
+        },
+    }
+    colour_line = (f"Label colours in use: {', '.join(colours)}. Use \"{other}\" for anything else."
+                   if colours else f"Colours aren't used; set colour to \"{other}\".")
+    try:
+        response = client.beta.messages.create(
+            model=model,
+            max_tokens=2000,
+            system=LABEL_PROMPT,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                {"type": "text", "text": f"Read this box's label. {colour_line}"},
+            ]}],
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+        )
+    except anthropic.AuthenticationError as exc:
+        raise AnalysisError("Claude rejected the API key. Check ANTHROPIC_API_KEY.") from exc
+    except anthropic.RateLimitError as exc:
+        raise AnalysisError("Claude is rate limiting requests. Wait a moment and try again.") from exc
+    except anthropic.APIStatusError as exc:
+        raise AnalysisError(f"Claude API error ({exc.status_code}): {exc.message}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise AnalysisError("Couldn't reach the Claude API. Check the server's internet connection.") from exc
+
+    text = next((b.text for b in response.content if b.type == "text"), None)
+    if response.stop_reason == "refusal" or not text:
+        raise AnalysisError("Claude couldn't read this photo. Type the box number instead.")
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AnalysisError("Claude returned something that wasn't valid JSON.") from exc
+
+    number = "".join(ch for ch in str(out.get("number") or "") if ch.isalnum())
+    colour = out.get("colour") if out.get("colour") in colours else ""
+    has_label = bool(out.get("has_label")) and bool(number)
+    return {
+        "has_label": has_label,
+        "colour": colour if has_label else "",
+        "number": number if has_label else "",
+        "confidence": out.get("confidence", "low") if has_label else "low",
+        "note": str(out.get("note") or ""),
+    }

@@ -17,6 +17,18 @@
 <main>
   <!-- 1. Pick a box -->
   <section id="stepBox" class="step">
+    <div id="labellingNote" class="note" hidden></div>
+    <label class="primary file-btn">
+      <input id="labelPhoto" type="file" accept="image/*" capture="environment" hidden>
+      Photograph the label
+    </label>
+    <div id="labelResult" class="label-result" hidden>
+      <img id="labelThumb" alt="Label photo">
+      <div><p id="labelText"></p><p id="labelNote" class="hint"></p></div>
+    </div>
+    <button id="unlabelledBtn" class="secondary" type="button" hidden>Start as a new box without a label</button>
+
+    <p class="divider"><span>or type it in</span></p>
     <div id="colourField" hidden>
       <p class="big-label" id="colourLabel">Label colour</p>
       <div id="colourPick" class="colours" role="radiogroup" aria-labelledby="colourLabel"></div>
@@ -25,6 +37,20 @@
     <input id="boxNumber" class="box-number" inputmode="numeric" autocomplete="off" placeholder="42">
     <p id="boxHint" class="hint"></p>
     <button id="startBtn" class="primary">Start</button>
+
+    <div id="otherActions">
+      <button id="noLabelBtn" class="link-btn" type="button">This box has no label yet</button>
+      <button id="labelLaterBtn" class="link-btn" type="button">Label an unlabelled box</button>
+    </div>
+    <button id="cancelLabelling" class="secondary" type="button" hidden>Cancel</button>
+  </section>
+
+  <!-- 1b. Unlabelled boxes -->
+  <section id="stepUnlabelled" class="step" hidden>
+    <h2>Unlabelled boxes</h2>
+    <p class="hint">Pick the box you've just put a label on, or open one to add things.</p>
+    <div id="unlabelledList"></div>
+    <button id="backFromUnlabelled" class="secondary" type="button">Back</button>
   </section>
 
   <!-- 2. Photos and description -->

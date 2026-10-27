@@ -16,7 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .analyze import AnalysisError, analyze_box
+from .analyze import AnalysisError, analyze_box, read_label
 from .config import Settings, settings as default_settings
 from .homebox import Homebox, HomeboxError, Photo
 
@@ -129,53 +129,144 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             "maxPhotos": MAX_PHOTOS,
         }
 
-    @app.get("/api/box/{number}")
-    async def get_box(number: str, request: Request, colour: str = ""):
-        name = box_name(number, colour)
+    async def box_by_id(request: Request, box_id: str) -> dict:
+        """Fetch a box by its Homebox id, checking it's one of ours."""
+        try:
+            box = await hb(request).get_entity(box_id)
+        except HomeboxError:
+            raise HTTPException(404, "That box no longer exists in Homebox.")
+        if not (box.get("entityType") or {}).get("isLocation", True):
+            raise HTTPException(400, "That isn't a box.")
         pid = await parent_id(request, create=False)
-        box = None if pid == "" else await hb(request).find_location(name, pid)
+        if pid is not None and (box.get("parent") or {}).get("id") != pid:
+            raise HTTPException(400, f"That box isn't in “{settings.parent_location}”.")
+        return box
+
+    async def box_info(request: Request, name: str, box: dict | None) -> dict:
+        unlabelled = settings.unlabelled_number(name) is not None
         if not box:
-            return {"boxName": name, "exists": False, "items": [], "photoCount": 0}
-        full = await hb(request).get_entity(box["id"])
+            return {"boxName": name, "exists": False, "unlabelled": unlabelled, "items": [], "photoCount": 0}
+        full = box if "attachments" in box else await hb(request).get_entity(box["id"])
         items = [summarize(i) for i in await hb(request).children(box["id"])]
         photos = [a for a in full.get("attachments") or [] if a.get("type") == "photo"]
         return {
-            "boxName": name, "exists": True, "id": box["id"], "link": box_link(box["id"]),
-            "items": items, "photoCount": len(photos), "notes": full.get("notes") or "",
+            "boxName": full["name"], "exists": True, "unlabelled": unlabelled, "id": box["id"],
+            "link": box_link(box["id"]), "items": items, "photoCount": len(photos), "notes": full.get("notes") or "",
         }
 
-    @app.post("/api/analyze")
-    async def analyze(request: Request, box_number: str = Form(...), colour: str = Form(""),
-                      transcript: str = Form(""), photos: list[UploadFile] = File(default=[])):
+    async def resolve_box(request: Request, number: str, colour: str, box_id: str) -> tuple[str | None, dict | None]:
+        """Work out which box a request is about. Returns (name, box).
+
+        By id: an existing box (labelled or not). By number and colour: that box, which may not exist yet.
+        Neither: a new box without a label, which gets its name when it's saved (name None)."""
+        if box_id.strip():
+            box = await box_by_id(request, box_id.strip())
+            return box["name"], box
+        if number.strip():
+            name = box_name(number, colour)
+            pid = await parent_id(request, create=False)
+            return name, (None if pid == "" else await hb(request).find_location(name, pid))
+        return None, None
+
+    async def unlabelled_boxes(request: Request) -> list[dict]:
+        pid = await parent_id(request, create=False)
+        if pid == "":
+            return []
+        found = await hb(request).find_locations(settings.unlabelled_prefix, pid)
+        boxes = [b for b in found if settings.unlabelled_number(b["name"]) is not None]
+        return sorted(boxes, key=lambda b: settings.unlabelled_number(b["name"]))
+
+    @app.get("/api/box/{number}")
+    async def get_box(number: str, request: Request, colour: str = ""):
+        name, box = await resolve_box(request, number, colour, "")
+        return await box_info(request, name, box)
+
+    @app.get("/api/box-by-id/{box_id}")
+    async def get_box_by_id(box_id: str, request: Request):
+        box = await box_by_id(request, box_id)
+        return await box_info(request, box["name"], box)
+
+    @app.post("/api/read-label")
+    async def read_label_route(request: Request, photo: UploadFile = File(...)):
+        """Read the colour and number off a label photo, and look that box up."""
+        pics = await read_photos([photo])
+        if not pics:
+            raise HTTPException(400, "The photo was empty.")
+        colours = [n for n, _ in settings.box_colours]
+        label = await run_in_threadpool(read_label, request.app.state.claude, settings.claude_model,
+                                        pics[0].content, colours)
+        log.info("Read label: %s", label)
+        box = None
+        if label["has_label"] and (label["colour"] or not colours):
+            name, found = await resolve_box(request, label["number"], label["colour"], "")
+            box = await box_info(request, name, found)
+        return {"label": label, "box": box}
+
+    @app.get("/api/unlabelled")
+    async def list_unlabelled(request: Request):
+        boxes = []
+        for b in await unlabelled_boxes(request):
+            items = await hb(request).children(b["id"])
+            boxes.append({"id": b["id"], "boxName": b["name"], "itemCount": len(items),
+                          "items": [i["name"] for i in items[:6]], "link": box_link(b["id"])})
+        return {"boxes": boxes}
+
+    @app.post("/api/box-by-id/{box_id}/label")
+    async def label_box(box_id: str, request: Request, box_number: str = Form(...), colour: str = Form("")):
+        """Give a box a (new) label: renames it in Homebox."""
+        box = await box_by_id(request, box_id)
         name = box_name(box_number, colour)
+        if name == box["name"]:
+            return await box_info(request, name, box)
+        pid = await parent_id(request, create=False)
+        clash = await hb(request).find_location(name, pid or None)
+        if clash and clash["id"] != box_id:
+            raise HTTPException(409, f"{name} already exists. Check the label, or open {name} to see what's in it.")
+        old = box["name"]
+        await hb(request).update_entity(box_id, box, name=name)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        await hb(request).append_notes(box_id, f"[{stamp}] Labelled {name} (was {old}).")
+        log.info("Relabelled %s as %s", old, name)
+        return await box_info(request, name, await hb(request).get_entity(box_id))
+
+    @app.post("/api/analyze")
+    async def analyze(request: Request, box_number: str = Form(""), colour: str = Form(""), box_id: str = Form(""),
+                      transcript: str = Form(""), photos: list[UploadFile] = File(default=[])):
+        name, box = await resolve_box(request, box_number, colour, box_id)
         pics = await read_photos(photos)
         tags = [t["name"] for t in await hb(request).list_tags()]
-        pid = await parent_id(request, create=False)
-        box = None if pid == "" else await hb(request).find_location(name, pid)
         existing = [summarize(i) for i in await hb(request).children(box["id"])] if box else []
         draft = await run_in_threadpool(
             analyze_box, request.app.state.claude, settings.claude_model, settings.claude_effort,
-            name, transcript, [p.content for p in pics], tags, existing,
+            name or "a new box without a label yet", transcript, [p.content for p in pics], tags, existing,
         )
-        log.info("Analysed %s: %d items, usage %s", name, len(draft.get("items", [])), draft.get("usage"))
+        log.info("Analysed %s: %d items, usage %s", name or "new unlabelled box",
+                 len(draft.get("items", [])), draft.get("usage"))
         return draft
 
     @app.post("/api/save")
-    async def save(request: Request, box_number: str = Form(...), colour: str = Form(""), items: str = Form("[]"),
-                   transcript: str = Form(""), box_summary: str = Form(""),
+    async def save(request: Request, box_number: str = Form(""), colour: str = Form(""), box_id: str = Form(""),
+                   items: str = Form("[]"), transcript: str = Form(""), box_summary: str = Form(""),
                    photos: list[UploadFile] = File(default=[])):
         try:
             item_list = json.loads(items)
             assert isinstance(item_list, list) and all(isinstance(i, dict) for i in item_list)
         except Exception:
             raise HTTPException(400, "items must be a JSON list of objects")
-        name = box_name(box_number, colour)
+        name, box = await resolve_box(request, box_number, colour, box_id)
         item_list = [i for i in item_list if str(i.get("name", "")).strip()]
         pics = await read_photos(photos)
         client = hb(request)
 
         pid = await parent_id(request, create=True)
-        box, created = await client.ensure_location(name, pid)
+        if box:
+            created = False
+        elif name:
+            box, created = await client.ensure_location(name, pid)
+        else:
+            taken = [settings.unlabelled_number(b["name"]) for b in await unlabelled_boxes(request)]
+            name = settings.unlabelled_name(max(taken, default=0) + 1)
+            box, created = await client.create_entity(name, "location", pid), True
         box_id = box["id"]
 
         all_tags = sorted({t.strip() for i in item_list for t in i.get("tags") or [] if t.strip()})

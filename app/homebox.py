@@ -175,8 +175,9 @@ class Homebox:
                 return items
             page_no += 1
 
-    async def append_notes(self, entity_id: str, text: str) -> None:
-        current = await self.get_entity(entity_id)
+    async def update_entity(self, entity_id: str, current: dict | None = None, **changes) -> dict:
+        """Change some fields of an entity, keeping everything else as it is."""
+        current = current or await self.get_entity(entity_id)
         body = {k: current.get(k) for k in _UPDATE_FIELDS}
         body["fields"] = body.get("fields") or []
         body["id"] = entity_id
@@ -185,9 +186,25 @@ class Homebox:
         parent = (current.get("parent") or {}).get("id")
         if parent:
             body["parentId"] = parent
+        body.update(changes)
+        return (await self._request("PUT", f"/entities/{entity_id}", json=body)).json()
+
+    async def append_notes(self, entity_id: str, text: str) -> None:
+        current = await self.get_entity(entity_id)
         existing = (current.get("notes") or "").strip()
-        body["notes"] = f"{existing}\n\n{text}".strip() if existing else text
-        await self._request("PUT", f"/entities/{entity_id}", json=body)
+        await self.update_entity(entity_id, current, notes=f"{existing}\n\n{text}".strip() if existing else text)
+
+    async def find_locations(self, query: str, parent_id: str | None) -> list[dict]:
+        """All locations whose name contains `query`, inside parent_id (any parent if None)."""
+        found, page_no = [], 1
+        while True:
+            page = await self._get("/entities", q=query, isLocation="true", pageSize=100, page=page_no)
+            for e in page.get("items", []):
+                if parent_id is None or (e.get("parent") or {}).get("id") == parent_id:
+                    found.append(e)
+            if page_no * 100 >= page.get("total", 0) or not page.get("items"):
+                return found
+            page_no += 1
 
     async def add_photo(self, entity_id: str, photo: Photo, primary: bool = False) -> None:
         await self._request(

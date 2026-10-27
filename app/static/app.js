@@ -2,8 +2,11 @@
 
 const $ = (id) => document.getElementById(id);
 const state = {
-  box: null,        // box number as typed
+  box: "",          // box number as typed ("" for a box without a label)
   colour: "",       // label colour ("" when the app isn't set up with colours)
+  boxId: null,      // Homebox id, used for boxes without a label
+  labelPhoto: null, // {blob, url} from "Photograph the label", added to the box's photos
+  labelling: null,  // {id, boxName} while giving an unlabelled box its label
   boxInfo: null,    // response from /api/box
   photos: [],       // [{blob, url}]
   draft: null,      // response from /api/analyze
@@ -31,7 +34,7 @@ async function api(path, opts = {}) {
 function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ } }
 function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
 function forget(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
-const draftKey = () => `box-draft-${state.colour ? state.colour + "-" : ""}${state.box}`;
+const draftKey = () => `box-draft-${state.boxId || [state.colour, state.box].filter(Boolean).join("-") || "new-unlabelled"}`;
 function saveDraft() {
   store(draftKey(), { transcript: $("transcript").value, items: state.draft ? collectItems() : null,
                       summary: state.draft?.box_summary || "" });
@@ -58,39 +61,176 @@ function renderColours() {
   }
 }
 function boxQuery() { return state.colour ? `?colour=${encodeURIComponent(state.colour)}` : ""; }
+function needsColour() { return (window.APP_CONFIG?.colours || []).length > 0; }
+function addBoxFields(fd) {
+  if (state.boxId) fd.append("box_id", state.boxId);
+  else if (state.box) { fd.append("box_number", state.box); fd.append("colour", state.colour); }
+}
+
+// Start a box by its label (colour + number typed or read from the photo)
 async function startBox(number) {
   number = String(number || "").trim();
-  if ((window.APP_CONFIG?.colours || []).length && !state.colour) { toast("Pick the label colour first."); return; }
+  if (needsColour() && !state.colour) { toast("Pick the label colour first."); return; }
   if (!number) { toast("Enter the box number first."); return; }
+  if (state.labelling) return saveLabel(number);
   busy("Checking Homebox…");
-  try {
-    state.box = number;
-    state.boxInfo = await api(`/api/box/${encodeURIComponent(number)}${boxQuery()}`);
-  } catch (e) { busy(); toast(e.message); return; }
+  let info;
+  try { info = await api(`/api/box/${encodeURIComponent(number)}${boxQuery()}`); }
+  catch (e) { busy(); toast(e.message); return; }
   busy();
+  state.box = number; state.boxId = null;
   store("last-box", { number, colour: state.colour });
-  $("boxBadge").textContent = state.boxInfo.boxName;
+  openBox(info);
+}
+
+// Open a box we know by its Homebox id (boxes without a label)
+async function startBoxById(id) {
+  busy("Checking Homebox…");
+  let info;
+  try { info = await api(`/api/box-by-id/${encodeURIComponent(id)}`); }
+  catch (e) { busy(); toast(e.message); return; }
+  busy();
+  state.box = ""; state.boxId = id;
+  openBox(info);
+}
+
+function startUnlabelled() {
+  state.box = ""; state.boxId = null;
+  openBox({ boxName: "New box without a label", exists: false, unlabelled: true, items: [] });
+}
+
+function openBox(info) {
+  state.boxInfo = info;
+  $("boxBadge").textContent = info.boxName;
   $("boxBadge").hidden = false;
 
   const note = $("existingNote");
-  if (state.boxInfo.exists && state.boxInfo.items.length) {
-    const list = state.boxInfo.items.slice(0, 8).map((i) => `<li>${escapeHtml(i.name)} ×${i.quantity}</li>`).join("");
-    const more = state.boxInfo.items.length > 8 ? `<li>…and ${state.boxInfo.items.length - 8} more</li>` : "";
-    note.innerHTML = `<strong>${escapeHtml(state.boxInfo.boxName)} already has ${state.boxInfo.items.length} item(s).</strong>
+  if (info.exists && info.items.length) {
+    const list = info.items.slice(0, 8).map((i) => `<li>${escapeHtml(i.name)} ×${i.quantity}</li>`).join("");
+    const more = info.items.length > 8 ? `<li>…and ${info.items.length - 8} more</li>` : "";
+    note.innerHTML = `<strong>${escapeHtml(info.boxName)} already has ${info.items.length} item(s).</strong>
       Anything you add now is added to it; Claude will skip what's already recorded.<ul>${list}${more}</ul>`;
     note.hidden = false;
-  } else if (state.boxInfo.exists) {
-    note.textContent = `${state.boxInfo.boxName} exists in Homebox but has no items yet.`;
+  } else if (info.exists) {
+    note.textContent = `${info.boxName} exists in Homebox but has no items yet.`;
+    note.hidden = false;
+  } else if (info.unlabelled) {
+    note.textContent = "It will be saved as the next “Unlabelled” box. Once it has a label, use “Label an unlabelled box” to give it its number.";
     note.hidden = false;
   } else {
     note.hidden = true;
   }
 
   clearPhotos();
+  if (state.labelPhoto) { state.photos.push(state.labelPhoto); state.labelPhoto = null; renderPhotos(); }
+  resetLabelResult();
   state.draft = null;
   const saved = load(draftKey());
   $("transcript").value = saved?.transcript || "";
   show("stepCapture");
+}
+
+// ---------- step 1: read the label from a photo ----------
+function resetLabelResult() {
+  $("labelResult").hidden = true;
+  $("unlabelledBtn").hidden = true;
+  if (state.labelPhoto) { URL.revokeObjectURL(state.labelPhoto.url); state.labelPhoto = null; }
+}
+async function readLabel(file) {
+  resetLabelResult();
+  const blob = await resizePhoto(file);
+  const fd = new FormData();
+  fd.append("photo", blob, "label.jpg");
+  busy("Reading the label…");
+  let res;
+  try { res = await api("/api/read-label", { method: "POST", body: fd }); }
+  catch (e) { busy(); toast(e.message); return; }
+  busy();
+  state.labelPhoto = { blob, url: URL.createObjectURL(blob) };
+  $("labelThumb").src = state.labelPhoto.url;
+  const { label, box } = res;
+  const panel = $("labelResult");
+  panel.classList.toggle("unsure", !label.has_label || label.confidence !== "high" || (needsColour() && !label.colour));
+  if (label.has_label) {
+    if (label.colour) { state.colour = label.colour; store("last-colour", label.colour); renderColours(); }
+    $("boxNumber").value = label.number;
+    const name = box ? box.boxName : [label.colour, label.number].filter(Boolean).join(" ");
+    let text = `<strong>${escapeHtml(name)}</strong>`;
+    if (!state.labelling) {
+      text += box && box.exists ? ` · already has ${box.items.length} item(s)` : box ? " · new box" : "";
+    }
+    $("labelText").innerHTML = text;
+    const checks = [];
+    if (needsColour() && !label.colour) checks.push("Couldn't tell the label colour. Pick it below.");
+    else if (label.confidence !== "high") checks.push("Not sure about this. Check the colour and number below.");
+    if (label.note) checks.push(label.note);
+    $("labelNote").textContent = checks.join(" ") || (state.labelling ? "Tap Save label if that's right." : "Tap Start if that's right.");
+  } else {
+    $("labelText").innerHTML = "<strong>No label found</strong>";
+    $("labelNote").textContent = label.note || "";
+    $("unlabelledBtn").hidden = !!state.labelling;
+  }
+  panel.hidden = false;
+}
+
+// ---------- step 1b: boxes without a label ----------
+async function showUnlabelled() {
+  busy("Loading…");
+  let res;
+  try { res = await api("/api/unlabelled"); }
+  catch (e) { busy(); toast(e.message); return; }
+  busy();
+  const list = $("unlabelledList");
+  list.innerHTML = res.boxes.length ? "" : '<p class="hint">No unlabelled boxes. Everything has a label.</p>';
+  for (const b of res.boxes) {
+    const div = document.createElement("div");
+    div.className = "ubox";
+    div.innerHTML = `<h3></h3><p></p><div class="row"><button class="secondary" type="button">Open</button>
+      <button class="primary" type="button">Give it a label</button></div>`;
+    div.querySelector("h3").textContent = b.boxName;
+    div.querySelector("p").textContent = b.itemCount
+      ? b.items.join(", ") + (b.itemCount > b.items.length ? ` and ${b.itemCount - b.items.length} more` : "")
+      : "No items yet";
+    const [open, label] = div.querySelectorAll("button");
+    open.onclick = () => startBoxById(b.id);
+    label.onclick = () => startLabelling(b);
+    list.appendChild(div);
+  }
+  show("stepUnlabelled");
+}
+function startLabelling(b) {
+  state.labelling = { id: b.id, boxName: b.boxName };
+  $("labellingNote").innerHTML = `Giving <strong>${escapeHtml(b.boxName)}</strong> its label. Photograph the new label or type it in.`;
+  setLabellingMode(true);
+  show("stepBox");
+}
+function setLabellingMode(on) {
+  if (!on) state.labelling = null;
+  $("labellingNote").hidden = !on;
+  $("otherActions").hidden = on;
+  $("cancelLabelling").hidden = !on;
+  $("startBtn").textContent = on ? "Save label" : "Start";
+  $("boxNumber").value = "";
+  resetLabelResult();
+  $("boxBadge").hidden = true;
+}
+async function saveLabel(number) {
+  const fd = new FormData();
+  fd.append("box_number", number);
+  fd.append("colour", state.colour);
+  busy("Saving the label…");
+  let info;
+  try { info = await api(`/api/box-by-id/${encodeURIComponent(state.labelling.id)}/label`, { method: "POST", body: fd }); }
+  catch (e) { busy(); toast(e.message); return; }
+  busy();
+  const old = state.labelling.boxName;
+  forget(`box-draft-${state.labelling.id}`);
+  const photo = state.labelPhoto; state.labelPhoto = null;
+  setLabellingMode(false);
+  toast(`${old} is now ${info.boxName}.`);
+  state.box = number; state.boxId = null; state.labelPhoto = photo;
+  store("last-box", { number, colour: state.colour });
+  openBox(info);
 }
 
 // ---------- step 2: photos ----------
@@ -196,8 +336,7 @@ async function analyse() {
   const transcript = $("transcript").value.trim();
   if (!state.photos.length && !transcript) { toast("Add a photo or describe what's in the box."); return; }
   const fd = new FormData();
-  fd.append("box_number", state.box);
-  fd.append("colour", state.colour);
+  addBoxFields(fd);
   fd.append("transcript", transcript);
   state.photos.forEach((p, i) => fd.append("photos", p.blob, `photo-${i + 1}.jpg`));
   busy("Claude is building the inventory… (usually under a minute)");
@@ -253,8 +392,7 @@ async function save() {
   const items = collectItems();
   if (!items.length && !state.photos.length) { toast("Nothing to save yet."); return; }
   const fd = new FormData();
-  fd.append("box_number", state.box);
-  fd.append("colour", state.colour);
+  addBoxFields(fd);
   fd.append("items", JSON.stringify(items));
   fd.append("transcript", $("transcript").value.trim());
   fd.append("box_summary", state.draft?.box_summary || "");
@@ -265,6 +403,7 @@ async function save() {
   catch (e) { busy(); toast(e.message); return; }
   busy();
   forget(draftKey());
+  if (!state.box) state.boxId = res.boxId; // a new box without a label is now known by its id
   $("doneTitle").textContent = `${res.boxName} saved`;
   $("doneText").textContent = `${res.itemsSaved} item(s) and ${res.photosSaved} photo(s) added${res.created ? " to a new box" : ""}.`;
   const link = $("doneLink");
@@ -278,17 +417,23 @@ function nextNumber() {
   return /^\d+$/.test(state.box) ? String(parseInt(state.box, 10) + 1) : "";
 }
 $("startBtn").onclick = () => startBox($("boxNumber").value);
+$("labelPhoto").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) readLabel(f); };
+$("unlabelledBtn").onclick = startUnlabelled;
+$("noLabelBtn").onclick = startUnlabelled;
+$("labelLaterBtn").onclick = showUnlabelled;
+$("backFromUnlabelled").onclick = () => show("stepBox");
+$("cancelLabelling").onclick = () => { setLabellingMode(false); showUnlabelled(); };
 $("boxNumber").addEventListener("keydown", (e) => { if (e.key === "Enter") startBox($("boxNumber").value); });
 $("photoInput").onchange = (e) => { addPhotos([...e.target.files]); e.target.value = ""; };
 $("photoPick").onchange = (e) => { addPhotos([...e.target.files]); e.target.value = ""; };
 $("transcript").addEventListener("input", saveDraft);
 $("analyseBtn").onclick = analyse;
-$("backToBox").onclick = () => { stopMic(); $("boxBadge").hidden = true; show("stepBox"); };
+$("backToBox").onclick = () => { stopMic(); $("boxBadge").hidden = true; resetLabelResult(); show("stepBox"); };
 $("backToCapture").onclick = () => show("stepCapture");
 $("addItem").onclick = () => addItemCard({}).querySelector(".name").focus();
 $("saveBtn").onclick = save;
-$("nextBox").onclick = () => { $("boxNumber").value = nextNumber(); $("boxBadge").hidden = true; show("stepBox"); $("boxNumber").focus(); };
-$("sameBox").onclick = () => startBox(state.box);
+$("nextBox").onclick = () => { $("boxNumber").value = nextNumber(); $("boxBadge").hidden = true; resetLabelResult(); show("stepBox"); };
+$("sameBox").onclick = () => (state.boxId ? startBoxById(state.boxId) : startBox(state.box));
 
 (async function init() {
   setupMic();

@@ -92,3 +92,12 @@ def test_save_rejects_items_that_are_not_objects():
             r = client.post("/api/save", data={"box_number": "1", "colour": "Red", "items": bad})
             assert r.status_code == 400, bad
             assert "JSON list" in r.json()["detail"]
+
+
+def test_unlabelled_names():
+    s = Settings()
+    assert s.unlabelled_name(3) == "Unlabelled 003"
+    assert s.unlabelled_number("Unlabelled 003") == 3
+    assert s.unlabelled_number(" unlabelled 12 ") == 12
+    assert s.unlabelled_number("Unlabelled stuff") is None
+    assert s.unlabelled_number("Box Red 003") is None

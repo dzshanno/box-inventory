@@ -2,13 +2,15 @@
 
 Inventory a storage box from your phone in about a minute:
 
-1. Pick the label colour and type the box number.
-2. Photograph the label and the open box.
+1. Photograph the box's label. Claude reads the colour and number; check them and tap **Start**. (Or type them in.)
+2. Photograph the open box.
 3. Tap the mic and say what's inside.
 4. Claude turns the photos and your description into an item list.
 5. Fix anything that's wrong, then tap **Save to Homebox**.
 
 In Homebox, each box becomes a location (for example `Storage Unit › Box Red 042`). The label colour is part of the box's identity, so red 042 and blue 042 are two different boxes. Everything in it becomes an item inside that location, with tags and quantities. The photos are attached to the box, and your spoken description is kept in the box's notes. A search for "boots" in Homebox then tells you which box to fetch.
+
+**No label yet?** Tap **This box has no label yet** (or it's offered when Claude finds no label). The box is saved as `Unlabelled 001`, `Unlabelled 002` and so on. Once you've stuck a label on, tap **Label an unlabelled box**, pick it from the list (it shows what's inside), and photograph or type the new label. The box is renamed and keeps everything in it. You can't give a box a label that another box already has.
 
 Opening a box that already exists shows what's recorded. Claude is told about those items and only suggests new ones, so you can add to a box later.
 
@@ -62,7 +64,7 @@ Nothing is exposed to the public internet, and you get a valid certificate. If y
 
 ## Cost
 
-Each box is one Claude request (`claude-opus-5-5` by default). With a few photos that's typically a few cents, so all 120 boxes come to a few dollars. `CLAUDE_EFFORT=low` is cheaper and faster, and `high` is more thorough. The server log records the token count for each box.
+Each box is one Claude request (`claude-opus-5-5` by default), plus a small one when you photograph the label. With a few photos that's typically a few cents, so all 120 boxes come to a few dollars. `CLAUDE_EFFORT=low` is cheaper and faster, and `high` is more thorough. The server log records the token count for each box.
 
 ## Settings
 
@@ -74,6 +76,7 @@ All settings go in `.env`. See `.env.example` for the full list. The main ones:
 | `BOX_COLOURS` | `Red, Blue` | Label colours you use. Add a screen colour with `Green=#2e7d32`. Empty turns colours off. |
 | `BOX_NAME_FORMAT` | `Box {colour} {n}` | How a box becomes a name. Must include `{colour}` if you have more than one colour. |
 | `BOX_NUMBER_DIGITS` | `3` | Zero-padding for numbers: red `42` becomes `Box Red 042`. |
+| `UNLABELLED_NAME` | `Unlabelled` | Name for boxes without a label: `Unlabelled 001`. |
 | `SAVE_TRANSCRIPT` | `true` | Store your spoken description in the box's notes. |
 | `HOMEBOX_PUBLIC_URL` | (empty) | Adds an "Open in Homebox" link after saving. |
 | `CLAUDE_EFFORT` | `medium` | `low`, `medium` or `high`. |
@@ -93,7 +96,7 @@ HOMEBOX_TEST_URL=http://localhost:7745 HOMEBOX_TEST_API_KEY=hb_... pytest
 
 Code layout:
 
-- `app/main.py`: web routes (`/api/box/{n}`, `/api/analyze`, `/api/save`)
-- `app/analyze.py`: the Claude prompt and output format
+- `app/main.py`: web routes (`/api/box/{n}`, `/api/read-label`, `/api/unlabelled`, `/api/analyze`, `/api/save`)
+- `app/analyze.py`: the Claude prompts (label reading and inventory) and output formats
 - `app/homebox.py`: Homebox API client
 - `app/static/`: the phone page

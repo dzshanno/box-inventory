@@ -56,6 +56,17 @@ class Settings:
     # Save the spoken description into the box's notes in Homebox.
     save_transcript: bool = field(default_factory=lambda: _bool("SAVE_TRANSCRIPT", True))
 
+    # Boxes without a label yet are called "Unlabelled 001", "Unlabelled 002"…
+    unlabelled_prefix: str = field(default_factory=lambda: os.environ.get("UNLABELLED_NAME", "Unlabelled"))
+
+    def unlabelled_name(self, n: int) -> str:
+        return f"{self.unlabelled_prefix} {str(n).zfill(self.box_number_digits)}"
+
+    def unlabelled_number(self, name: str) -> int | None:
+        """3 for "Unlabelled 003", None for anything that isn't an unlabelled box name."""
+        m = re.fullmatch(re.escape(self.unlabelled_prefix) + r"\s+(\d+)", name.strip(), re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
     def __post_init__(self):
         if len(self.box_colours) > 1 and "{colour}" not in self.box_name_format:
             raise ValueError("BOX_NAME_FORMAT must include {colour} when BOX_COLOURS lists more than one colour, "

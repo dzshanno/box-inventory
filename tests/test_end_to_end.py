@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from app.analyze import LABEL_PROMPT
 from app.config import Settings
 from app.homebox import Homebox
 from app.main import create_app
@@ -29,12 +30,16 @@ class FakeClaude:
 
     def __init__(self, items):
         self.items = items
+        self.label = {"has_label": False, "colour": "other", "number": "", "confidence": "low", "note": ""}
         self.calls = []
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        out = {"box_summary": "Winter clothes", "items": self.items, "questions": ["Is the red coat yours?"]}
+        if kwargs["system"] == LABEL_PROMPT:
+            out = self.label
+        else:
+            out = {"box_summary": "Winter clothes", "items": self.items, "questions": ["Is the red coat yours?"]}
         return SimpleNamespace(
             stop_reason="end_turn",
             content=[SimpleNamespace(type="text", text=json.dumps(out))],
@@ -70,7 +75,7 @@ def test_full_flow(setup):
     # A new box doesn't exist yet
     r = client.get("/api/box/7?colour=red")
     assert r.status_code == 200
-    assert r.json() == {"boxName": "Box Red 007", "exists": False, "items": [], "photoCount": 0}
+    assert r.json() == {"boxName": "Box Red 007", "exists": False, "unlabelled": False, "items": [], "photoCount": 0}
 
     # Analyse: photos are shrunk for Claude, transcript passed through
     r = client.post("/api/analyze", data={"box_number": "7", "colour": "Red",
@@ -145,3 +150,72 @@ def test_needs_photo_or_description(setup):
     r = client.post("/api/analyze", data={"box_number": "8", "colour": "Blue", "transcript": "  "})
     assert r.status_code == 422
     assert "photo or a description" in r.json()["detail"]
+
+
+def test_read_label(setup):
+    client, claude, _ = setup
+    photo = [("photo", ("label.jpg", jpeg(), "image/jpeg"))]
+    client.post("/api/save", data={"box_number": "12", "colour": "Blue", "items": '[{"name": "Kettle"}]'})
+
+    claude.label = {"has_label": True, "colour": "Blue", "number": "12", "confidence": "high", "note": ""}
+    r = client.post("/api/read-label", files=photo).json()
+    assert r["label"]["number"] == "12" and r["label"]["colour"] == "Blue"
+    assert r["box"]["boxName"] == "Box Blue 012" and r["box"]["exists"] and r["box"]["items"][0]["name"] == "Kettle"
+
+    claude.label = {"has_label": True, "colour": "Red", "number": "12", "confidence": "medium", "note": ""}
+    r = client.post("/api/read-label", files=photo).json()
+    assert r["box"]["boxName"] == "Box Red 012" and r["box"]["exists"] is False
+
+    # A colour that isn't configured: number kept, user picks the colour
+    claude.label = {"has_label": True, "colour": "other", "number": "12", "confidence": "high", "note": ""}
+    r = client.post("/api/read-label", files=photo).json()
+    assert r["label"]["number"] == "12" and r["label"]["colour"] == "" and r["box"] is None
+
+    claude.label = {"has_label": False, "colour": "other", "number": "", "confidence": "low", "note": "No label"}
+    r = client.post("/api/read-label", files=photo).json()
+    assert r["label"]["has_label"] is False and r["box"] is None and r["label"]["note"] == "No label"
+
+
+def test_unlabelled_boxes(setup):
+    client, claude, _ = setup
+    assert client.get("/api/unlabelled").json() == {"boxes": []}
+
+    # No number: each save makes the next unlabelled box
+    r = client.post("/api/save", data={"items": '[{"name": "Tent"}, {"name": "Sleeping bags", "quantity": 2}]'},
+                    files=[("photos", ("a.jpg", jpeg(), "image/jpeg"))]).json()
+    assert r["boxName"] == "Unlabelled 001" and r["created"] and r["photosSaved"] == 1
+    first = r["boxId"]
+    r = client.post("/api/save", data={"items": '[{"name": "Paint"}]'}).json()
+    assert r["boxName"] == "Unlabelled 002"
+    second = r["boxId"]
+
+    boxes = client.get("/api/unlabelled").json()["boxes"]
+    assert [(b["boxName"], b["itemCount"]) for b in boxes] == [("Unlabelled 001", 2), ("Unlabelled 002", 1)]
+    assert client.get(f"/api/box-by-id/{first}").json()["unlabelled"] is True
+
+    # Adding more to an unlabelled box by id: Claude is told what's already there
+    claude.items = [{"name": "Camping stove", "quantity": 1, "description": "", "tags": [], "source": "spoken",
+                     "confidence": "high"}]
+    client.post("/api/analyze", data={"box_id": first, "transcript": "and a stove"})
+    assert "Tent x1" in claude.calls[-1]["messages"][0]["content"][-1]["text"]
+    r = client.post("/api/save", data={"box_id": first, "items": '[{"name": "Camping stove"}]'}).json()
+    assert r["boxName"] == "Unlabelled 001" and r["created"] is False
+
+    # Label it later: it's renamed, keeps its contents, and leaves the unlabelled list
+    r = client.post(f"/api/box-by-id/{first}/label", data={"box_number": "9", "colour": "blue"})
+    assert r.status_code == 200, r.text
+    assert r.json()["boxName"] == "Box Blue 009" and r.json()["unlabelled"] is False
+    box = client.get("/api/box/9?colour=Blue").json()
+    assert box["exists"] and box["id"] == first and len(box["items"]) == 3
+    assert "Labelled Box Blue 009 (was Unlabelled 001)" in box["notes"]
+    assert [b["boxName"] for b in client.get("/api/unlabelled").json()["boxes"]] == ["Unlabelled 002"]
+
+    # Can't give a second box the same label
+    r = client.post(f"/api/box-by-id/{second}/label", data={"box_number": "009", "colour": "Blue"})
+    assert r.status_code == 409 and "Box Blue 009 already exists" in r.json()["detail"]
+
+    # Numbering carries on after the highest unlabelled box
+    assert client.post("/api/save", data={"items": "[]"}).json()["boxName"] == "Unlabelled 003"
+
+    # Unknown ids are rejected
+    assert client.get("/api/box-by-id/nope").status_code == 404

@@ -1,3 +1,4 @@
+[hidden] { display: none !important; }
 :root {
   --bg: #f6f5f1;
   --card: #ffffff;
@@ -124,3 +125,19 @@ a { color: var(--accent); }
 }
 .colour-chip[aria-checked="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
 .colour-chip .swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(0, 0, 0, .25); flex: none; }
+
+.divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; margin: 18px 0 6px; }
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.label-result { display: flex; gap: 12px; align-items: center; background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 10px; margin: 4px 0 6px; }
+.label-result img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; flex: none; }
+.label-result p { margin: 0; }
+.label-result.unsure { border-color: var(--warn-text); background: var(--warn-bg); color: var(--warn-text); }
+.label-result.unsure .hint { color: inherit; }
+#otherActions { display: flex; flex-direction: column; align-items: center; margin-top: 8px; }
+#otherActions .link-btn { width: auto; margin: 2px 0; }
+.ubox { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin: 10px 0; }
+.ubox h3 { margin: 0 0 4px; font-size: 17px; }
+.ubox p { margin: 0 0 8px; color: var(--muted); font-size: 15px; }
+.ubox .row > button { margin: 0; }
+#stepBox .big-label { margin-top: 14px; }
