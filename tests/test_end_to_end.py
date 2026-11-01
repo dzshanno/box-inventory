@@ -461,3 +461,36 @@ def test_save_for_later(setup):
     assert client.delete(f"/api/queue/{bad['id']}").status_code == 200
     assert client.get(f"/api/queue/{bad['id']}").status_code == 404
     assert client.get("/api/queue/not-a-job").status_code == 404
+
+
+def test_nested_places(setup):
+    client, _, settings = setup
+    r = client.post("/api/places", data={"name": "Lockup > End Room"})
+    assert r.status_code == 200, r.text
+    end_room = r.json()
+    assert end_room["name"] == "Lockup › End Room"
+    # Same place again (any case, either arrow): no duplicate.
+    assert client.post("/api/places", data={"name": "lockup › end room"}).json()["id"] == end_room["id"]
+    shelf = client.post("/api/places", data={"name": "Lockup > End Room > Top shelf"}).json()
+    assert shelf["name"] == "Lockup › End Room › Top shelf"
+    names = [p["name"] for p in client.get("/api/places").json()["places"]]
+    assert names == ["Lockup", "Lockup › End Room", "Lockup › End Room › Top shelf"]
+    assert client.post("/api/places", data={"name": "Lockup > Box Red 001"}).status_code == 400
+
+    # A box in a nested place shows the full path everywhere.
+    r = client.post("/api/save", data={"box_number": "31", "colour": "Blue", "location_id": shelf["id"],
+                                       "items": json.dumps([{"name": "Tent", "quantity": 1}])})
+    assert r.status_code == 200, r.text
+    saved = r.json()
+    assert saved["place"] == "Lockup › End Room › Top shelf"
+    info = client.get("/api/box/31?colour=Blue").json()
+    assert info["place"] == {"id": shelf["id"], "name": "Lockup › End Room › Top shelf"}
+    assert info["lastSeen"]["place"] == "Lockup › End Room › Top shelf"
+    assert next(p for p in client.get("/api/places").json()["places"] if p["id"] == shelf["id"])["boxCount"] == 1
+    found = client.get("/api/search?q=tent").json()
+    assert "Top shelf" in json.dumps(found)
+
+    # Moving it up a level.
+    r = client.post(f"/api/box-by-id/{saved['boxId']}/move", data={"location_id": end_room["id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["place"]["name"] == "Lockup › End Room"

@@ -81,7 +81,7 @@ function renderPlacePick(select, selected, suggestions = []) {
 async function choosePlace(select) {
   let value = select.value;
   if (value === "__new" || value.startsWith("ha:")) {
-    const name = value === "__new" ? (prompt("Name of the place (e.g. Workshop, Under the stairs)") || "").trim() : value.slice(3);
+    const name = value === "__new" ? (prompt("Name of the place (e.g. Workshop). For a place inside another, use >, e.g. Lockup > Shelf 3") || "").trim() : value.slice(3);
     if (!name) { select.value = select.dataset.current; return ""; }
     const fd = new FormData(); fd.append("name", name);
     let place;

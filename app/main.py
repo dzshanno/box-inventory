@@ -105,32 +105,71 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             want = settings.storage_root.strip().lower()
             found = next((l for l in locs if not parent_of(l) and l["name"].strip().lower() == want), None)
             root = found["id"] if found else ""  # "" = not created yet, so no places either
-        places = {} if root == "" else {
-            l["id"]: l for l in locs
-            if parent_of(l) == root and l["id"] != root and not settings.is_box_name(l["name"])}
+        by_id = {l["id"]: l for l in locs}
+
+        def place_names(loc: dict) -> list[str] | None:
+            """Names from the top down to this place ("24 Shirburn Street", "Workshop"), or None if it isn't a place."""
+            names: list[str] = []
+            while True:
+                if loc["id"] == root:
+                    return names or None
+                if settings.is_box_name(loc["name"]) or len(names) > 30:  # a box, or a loop
+                    return None
+                names.insert(0, loc["name"])
+                pid = parent_of(loc)
+                if not pid:
+                    return names if root is None else None
+                loc = by_id.get(pid)
+                if loc is None:
+                    return None
+
+        # Places can be nested (Lockup › End Room); each gets its full path for showing.
+        places = {}
+        if root != "":
+            for l in locs:
+                names = place_names(l)
+                if names:
+                    places[l["id"]] = {**l, "path": " › ".join(names)}
         boxes = {l["id"]: l for l in locs if parent_of(l) in places and settings.is_box_name(l["name"])}
         data = {"root": root, "places": places, "boxes": boxes,
                 "by_name": {b["name"].strip().lower(): b for b in boxes.values()}}
         layout_cache.update(at=time.monotonic(), data=data)
         return data
 
+    def place_label(place: dict) -> str:
+        return place.get("path") or place.get("name", "")
+
+    def place_of(lay: dict, entity: dict) -> str:
+        """Where a box is, as a full path ("Lockup › End Room")."""
+        parent = lay["places"].get(parent_of(entity))
+        return place_label(parent) if parent else (entity.get("parent") or {}).get("name", "")
+
     async def ensure_place(request: Request, name: str) -> dict:
-        name = " ".join(name.split())[:255]
-        if not name:
+        """Find or make a place. "Lockup > Shelf 3" (or ›) is Shelf 3 inside Lockup."""
+        parts = [" ".join(p.split())[:255] for p in re.split(r"[›>]", name)]
+        parts = [p for p in parts if p]
+        if not parts:
             raise HTTPException(400, "Give the place a name.")
-        if settings.is_box_name(name):
-            raise HTTPException(400, f"“{name}” looks like a box name. Pick another name for the place.")
+        for part in parts:
+            if settings.is_box_name(part):
+                raise HTTPException(400, f"“{part}” looks like a box name. Pick another name for the place.")
         lay = await layout(request)
-        for p in lay["places"].values():
-            if p["name"].strip().lower() == name.lower():
-                return p
-        root = lay["root"]
-        if root == "":
+        parent = lay["root"]
+        if parent == "":
             root_loc, _ = await hb(request).ensure_location(settings.storage_root, None)
-            root = root_loc["id"]
-        place = await hb(request).create_entity(name, "location", root)
-        log.info("Added place %s", name)
-        forget_catalogue()
+            parent = root_loc["id"]
+        places = dict(lay["places"])
+        place: dict = {}
+        for part in parts:
+            place = next((p for p in places.values()
+                          if parent_of(p) == parent and p["name"].strip().lower() == part.lower()), None) or {}
+            if not place:
+                place = await hb(request).create_entity(part, "location", parent)
+                place["path"] = " › ".join(parts[:parts.index(part) + 1])
+                log.info("Added place %s", place["path"])
+                forget_catalogue()
+                places = {}  # anything inside a new place is new too
+            parent = place["id"]
         return place
 
     async def pick_place(request: Request, location_id: str) -> dict:
@@ -156,7 +195,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
     async def mark_seen(request: Request, box_id: str, how: str, spot: str = "") -> None:
         """Record when and where a box was last seen, in a "Last seen" field Homebox shows too."""
         current = await hb(request).get_entity(box_id)
-        place = (current.get("parent") or {}).get("name", "")
+        place = place_of(await layout(request), current)
         text = " · ".join(x for x in (datetime.now().strftime("%Y-%m-%d %H:%M"), place, how, spot.strip()) if x)
         fields = [f for f in current.get("fields") or [] if f.get("name") != LAST_SEEN]
         fields.append({"name": LAST_SEEN, "type": "text", "textValue": text})
@@ -234,7 +273,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         parent = full.get("parent") or {}
         return {
             "boxName": full["name"], "exists": True, "unlabelled": unlabelled, "id": box["id"],
-            "place": {"id": parent.get("id"), "name": parent.get("name", "")}, "lastSeen": last_seen(full),
+            "place": {"id": parent.get("id"), "name": place_of(await layout(request), full)}, "lastSeen": last_seen(full),
             "link": box_link(box["id"]), "items": items, "photoCount": len(photos), "notes": full.get("notes") or "",
         }
 
@@ -262,9 +301,9 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         counts: dict[str, int] = {}
         for b in lay["boxes"].values():
             counts[parent_of(b)] = counts.get(parent_of(b), 0) + 1
-        places = sorted(({"id": p["id"], "name": p["name"], "boxCount": counts.get(p["id"], 0)}
+        places = sorted(({"id": p["id"], "name": place_label(p), "boxCount": counts.get(p["id"], 0)}
                          for p in lay["places"].values()), key=lambda p: p["name"].lower())
-        have = {p["name"].strip().lower() for p in places}
+        have = {p["name"].strip().lower() for p in lay["places"].values()}
         areas = await area_names(settings.ha_url, settings.ha_token)
         return {"places": places, "suggestions": [a for a in areas if a.lower() not in have],
                 "defaultPlace": settings.default_place}
@@ -272,20 +311,20 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
     @app.post("/api/places")
     async def add_place(request: Request, name: str = Form(...)):
         place = await ensure_place(request, name)
-        return {"id": place["id"], "name": place["name"]}
+        return {"id": place["id"], "name": place_label(place)}
 
     @app.post("/api/box-by-id/{box_id}/move")
     async def move_box(box_id: str, request: Request, location_id: str = Form(...)):
         """Move a box to another place."""
         box = await box_by_id(request, box_id)
         place = await pick_place(request, location_id)
-        old = (box.get("parent") or {}).get("name", "")
+        old = place_of(await layout(request), box)
         if parent_of(box) != place["id"]:
             await hb(request).update_entity(box_id, box, parentId=place["id"])
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            await hb(request).append_notes(box_id, f"[{stamp}] Moved from {old} to {place['name']}.")
+            await hb(request).append_notes(box_id, f"[{stamp}] Moved from {old} to {place_label(place)}.")
             await mark_seen(request, box_id, "moved here")
-            log.info("Moved %s from %s to %s", box["name"], old, place["name"])
+            log.info("Moved %s from %s to %s", box["name"], old, place_label(place))
             forget_catalogue()
         return await box_info(request, box["name"], await hb(request).get_entity(box_id))
 
@@ -323,7 +362,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         for b in await unlabelled_boxes(request):
             items = await hb(request).children(b["id"])
             boxes.append({"id": b["id"], "boxName": b["name"], "itemCount": len(items),
-                          "place": (b.get("parent") or {}).get("name", ""),
+                          "place": place_of(await layout(request), b),
                           "items": [i["name"] for i in items[:6]], "link": box_link(b["id"])})
         return {"boxes": boxes}
 
@@ -353,7 +392,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         boxes, places = lay["boxes"], lay["places"]
 
         def place_name(box: dict) -> str:
-            return (places.get(parent_of(box)) or {}).get("name", "")
+            return place_label(places.get(parent_of(box)) or {})
 
         items = []
         for e in await hb(request).search("", limit=20000):
@@ -376,13 +415,14 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             g["items"].append({k: v for k, v in i.items() if k not in ("boxId", "boxName", "place", "score")})
         groups_list = list(groups.values())[:30]
         # Where each box is and when it was last seen (one Homebox read per box, in parallel)
+        lay = await layout(request)
         entities = await asyncio.gather(*(hb(request).get_entity(g["boxId"]) for g in groups_list),
                                         return_exceptions=True)
         for g, e in zip(groups_list, entities):
             g["link"] = box_link(g["boxId"])
             g["unlabelled"] = settings.unlabelled_number(g["boxName"]) is not None
             ok = isinstance(e, dict)
-            g["place"] = (e.get("parent") or {}).get("name", "") if ok else ""
+            g["place"] = place_of(lay, e) if ok else ""
             g["lastSeen"] = last_seen(e) if ok else None
         return groups_list
 
@@ -511,7 +551,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             # You're standing with the box, so if you picked a different place, it has moved.
             if location_id.strip() and location_id.strip() != parent_of(box):
                 place = await pick_place(request, location_id)
-                moved_from = (box.get("parent") or {}).get("name", "")
+                moved_from = place_of(await layout(request), box)
                 box = await client.update_entity(box["id"], await client.get_entity(box["id"]), parentId=place["id"])
         else:
             place = await pick_place(request, location_id)
@@ -558,7 +598,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         await mark_seen(request, box_id, "photographed" if pics else "updated")
         log.info("Saved %s: %d items, %d photos", name, len(saved), len(pics))
         forget_catalogue()
-        place_name = ((await client.get_entity(box_id)).get("parent") or {}).get("name", "")
+        place_name = place_of(await layout(request), await client.get_entity(box_id))
         if queue_id.strip():  # it came from "save for later": that copy is done with
             try:
                 shutil.rmtree(job_dir(queue_id.strip()), ignore_errors=True)
@@ -659,8 +699,8 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         if not pics and not transcript.strip():
             raise HTTPException(400, "Add a photo or describe what's in the box.")
         place = (await layout(request))["places"].get(location_id.strip())
-        place_name = place["name"] if place else ((box or {}).get("parent") or {}).get("name") or settings.default_place
-        job = {"id": uuid.uuid4().hex, "created": datetime.now().isoformat(timespec="seconds"),
+        place_name = place_label(place) if place else (place_of(await layout(request), box) if box else settings.default_place)
+        job = {"id": uuid.uuid4().hex, "created": datetime.now().isoformat(timespec="microseconds"),  # also the order
                "boxNumber": box_number.strip(), "colour": colour.strip(), "boxId": box_id.strip(),
                "boxName": name or "New box without a label", "locationId": location_id.strip(), "place": place_name,
                "transcript": transcript.strip(), "photos": [], "status": "waiting", "error": "", "draft": None}
