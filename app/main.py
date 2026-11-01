@@ -6,11 +6,15 @@ import base64
 import asyncio
 import json
 import logging
+import re
 import secrets
+import shutil
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import anthropic
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -40,7 +44,9 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
             settings.homebox_username, settings.homebox_password,
         )
         app.state.claude = claude or anthropic.Anthropic()
+        worker = asyncio.create_task(queue_worker())
         yield
+        worker.cancel()
         await app.state.homebox.close()
 
     app = FastAPI(title="Box Inventory", lifespan=lifespan)
@@ -487,7 +493,7 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
     @app.post("/api/save")
     async def save(request: Request, box_number: str = Form(""), colour: str = Form(""), box_id: str = Form(""),
                    location_id: str = Form(""), items: str = Form("[]"), transcript: str = Form(""),
-                   box_summary: str = Form(""),
+                   box_summary: str = Form(""), queue_id: str = Form(""),
                    photos: list[UploadFile] = File(default=[])):
         try:
             item_list = json.loads(items)
@@ -553,8 +559,154 @@ def create_app(settings: Settings = default_settings, homebox: Homebox | None = 
         log.info("Saved %s: %d items, %d photos", name, len(saved), len(pics))
         forget_catalogue()
         place_name = ((await client.get_entity(box_id)).get("parent") or {}).get("name", "")
+        if queue_id.strip():  # it came from "save for later": that copy is done with
+            try:
+                shutil.rmtree(job_dir(queue_id.strip()), ignore_errors=True)
+            except HTTPException:
+                pass
         return {"boxName": name, "boxId": box_id, "created": created, "itemsSaved": len(saved),
                 "photosSaved": len(pics), "link": box_link(box_id), "place": place_name, "movedFrom": moved_from}
+
+    # ---- save for later -------------------------------------------------
+    # A box captured now (photos + description) is analysed in the background, one at a time,
+    # then waits for you to check it and save it to Homebox. Each one is a folder in QUEUE_DIR
+    # holding job.json and the photos; it's removed once saved or deleted.
+    queue_dir = Path(settings.queue_dir)
+    queue_wake = asyncio.Event()
+
+    def job_dir(job_id: str) -> Path:
+        path = queue_dir / job_id
+        if not re.fullmatch(r"[0-9a-f]{32}", job_id) or not (path / "job.json").exists():
+            raise HTTPException(404, "That saved box isn't there any more.")
+        return path
+
+    def read_job(path: Path) -> dict:
+        return json.loads((path / "job.json").read_text())
+
+    def write_job(path: Path, job: dict) -> None:
+        tmp = path / "job.json.tmp"
+        tmp.write_text(json.dumps(job))
+        tmp.replace(path / "job.json")
+
+    def all_jobs() -> list[dict]:
+        jobs = []
+        if queue_dir.is_dir():
+            for path in queue_dir.iterdir():
+                try:
+                    jobs.append(read_job(path))
+                except (OSError, ValueError):
+                    continue  # half-written or not a job
+        return sorted(jobs, key=lambda j: j["created"])
+
+    def job_summary(job: dict) -> dict:
+        draft = job.get("draft") or {}
+        return {"id": job["id"], "boxName": job["boxName"], "place": job["place"], "created": job["created"],
+                "status": job["status"], "error": job.get("error", ""), "photoCount": len(job["photos"]),
+                "itemCount": len(draft.get("items") or []), "summary": draft.get("box_summary", ""),
+                "thumb": f"/api/queue/{job['id']}/photo/1" if job["photos"] else None}
+
+    async def analyse_job(path: Path) -> None:
+        job = read_job(path)
+        job.update(status="working", error="")
+        write_job(path, job)
+        try:
+            ctx = SimpleNamespace(app=app)  # the Homebox helpers only use request.app
+            name, box = await resolve_box(ctx, job["boxNumber"], job["colour"], job["boxId"])
+            tags = [t["name"] for t in await hb(ctx).list_tags()]
+            existing = [summarize(i) for i in await hb(ctx).children(box["id"])] if box else []
+            photos = [(path / p["file"]).read_bytes() for p in job["photos"]]
+            draft = await run_in_threadpool(
+                analyze_box, app.state.claude, settings.claude_model, settings.claude_effort,
+                name or "a new box without a label yet", job["transcript"], photos, tags, existing,
+            )
+            job.update(status="ready", draft=draft)
+            log.info("Analysed saved %s: %d items, usage %s", job["boxName"], len(draft.get("items", [])),
+                     draft.get("usage"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # keep the job so it can be retried
+            log.warning("Saved box %s failed: %s", job["boxName"], exc)
+            job.update(status="failed", error=str(getattr(exc, "detail", "") or exc) or type(exc).__name__)
+        if path.exists():  # unless it was deleted meanwhile
+            write_job(path, job)
+
+    async def queue_worker() -> None:
+        for job in all_jobs():  # interrupted by a restart: start those again
+            if job["status"] == "working":
+                job["status"] = "waiting"
+                write_job(queue_dir / job["id"], job)
+        while True:
+            queue_wake.clear()
+            waiting = [j for j in all_jobs() if j["status"] == "waiting"]
+            if not waiting:
+                await queue_wake.wait()
+                continue
+            try:
+                await analyse_job(queue_dir / waiting[0]["id"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Queue worker error")
+                await asyncio.sleep(5)
+
+    @app.post("/api/queue")
+    async def queue_box(request: Request, box_number: str = Form(""), colour: str = Form(""), box_id: str = Form(""),
+                        location_id: str = Form(""), transcript: str = Form(""),
+                        photos: list[UploadFile] = File(default=[])):
+        """Save a box's photos and description now; Claude works on it in the background."""
+        name, box = await resolve_box(request, box_number, colour, box_id)
+        pics = await read_photos(photos)
+        if not pics and not transcript.strip():
+            raise HTTPException(400, "Add a photo or describe what's in the box.")
+        place = (await layout(request))["places"].get(location_id.strip())
+        place_name = place["name"] if place else ((box or {}).get("parent") or {}).get("name") or settings.default_place
+        job = {"id": uuid.uuid4().hex, "created": datetime.now().isoformat(timespec="seconds"),
+               "boxNumber": box_number.strip(), "colour": colour.strip(), "boxId": box_id.strip(),
+               "boxName": name or "New box without a label", "locationId": location_id.strip(), "place": place_name,
+               "transcript": transcript.strip(), "photos": [], "status": "waiting", "error": "", "draft": None}
+        path = queue_dir / job["id"]
+        path.mkdir(parents=True)
+        for i, pic in enumerate(pics, 1):
+            (path / f"photo-{i}.jpg").write_bytes(pic.content)
+            job["photos"].append({"file": f"photo-{i}.jpg", "type": pic.content_type})
+        write_job(path, job)
+        queue_wake.set()
+        log.info("Saved %s for later (%d photos)", job["boxName"], len(pics))
+        return job_summary(job)
+
+    @app.get("/api/queue")
+    async def list_queue():
+        return {"jobs": [job_summary(j) for j in all_jobs()]}
+
+    @app.get("/api/queue/{job_id}")
+    async def get_queued(job_id: str):
+        job = read_job(job_dir(job_id))
+        return {**job_summary(job), "boxNumber": job["boxNumber"], "colour": job["colour"], "boxId": job["boxId"],
+                "locationId": job["locationId"], "transcript": job["transcript"], "draft": job.get("draft"),
+                "photos": [f"/api/queue/{job_id}/photo/{i}" for i in range(1, len(job["photos"]) + 1)]}
+
+    @app.get("/api/queue/{job_id}/photo/{n}")
+    async def queued_photo(job_id: str, n: int):
+        path = job_dir(job_id)
+        photos = read_job(path)["photos"]
+        if not 1 <= n <= len(photos):
+            raise HTTPException(404, "No such photo.")
+        return FileResponse(path / photos[n - 1]["file"], media_type=photos[n - 1]["type"])
+
+    @app.post("/api/queue/{job_id}/retry")
+    async def retry_queued(job_id: str):
+        path = job_dir(job_id)
+        job = read_job(path)
+        if job["status"] in ("failed", "ready"):
+            job.update(status="waiting", error="", draft=None)
+            write_job(path, job)
+            queue_wake.set()
+        return job_summary(job)
+
+    @app.delete("/api/queue/{job_id}")
+    async def delete_queued(job_id: str):
+        shutil.rmtree(job_dir(job_id), ignore_errors=True)
+        return {"deleted": job_id}
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app

@@ -63,10 +63,10 @@ def jpeg():
 
 
 @pytest.fixture
-def setup():
+def setup(tmp_path):
     root = f"Test Home {uuid.uuid4().hex[:6]}"  # keeps each test's places and boxes apart
     settings = replace(Settings(), homebox_url=URL, homebox_api_key=KEY, storage_root=root,
-                       homebox_public_url="http://hb.example")
+                       homebox_public_url="http://hb.example", queue_dir=str(tmp_path / "queue"))
     claude = FakeClaude([
         {"name": "Winter boots", "quantity": 2, "description": "Black leather", "tags": ["Clothing", "Shoes"],
          "source": "both", "confidence": "high"},
@@ -402,3 +402,62 @@ def test_places_and_last_seen(setup, monkeypatch):
     client.post("/api/locate", data={"box_ids": box["id"]}, files=[("photo", ("r.jpg", jpeg(), "image/jpeg"))])
     seen = client.get(f"/api/box-by-id/{box['id']}").json()["lastSeen"]
     assert seen["how"] == "spotted in a photo" and seen["spot"] == "top shelf, left" and seen["place"] == "workshop"
+
+
+def wait_for(client, job_id, statuses=("ready", "failed"), timeout=20):
+    import time
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        job = client.get(f"/api/queue/{job_id}").json()
+        if job["status"] in statuses:
+            return job
+        time.sleep(0.1)
+    raise AssertionError(f"saved box stuck at {job['status']}")
+
+
+def test_save_for_later(setup):
+    client, claude, settings = setup
+    # Save two boxes for later: one labelled, one without a label.
+    r = client.post("/api/queue", data={"box_number": "7", "colour": "Red", "transcript": "boots and scarves"},
+                    files=[("photos", ("a.jpg", jpeg(), "image/jpeg")), ("photos", ("b.jpg", jpeg(), "image/jpeg"))])
+    assert r.status_code == 200, r.text
+    red = r.json()
+    assert red["boxName"] == "Box Red 007" and red["photoCount"] == 2 and red["status"] in ("waiting", "working")
+    plain = client.post("/api/queue", data={"transcript": "old cables"}).json()
+    assert plain["boxName"] == "New box without a label"
+
+    # Nothing to analyse: refused.
+    assert client.post("/api/queue", data={"box_number": "8", "colour": "Red"}).status_code == 400
+
+    job = wait_for(client, red["id"])
+    assert job["status"] == "ready" and job["itemCount"] == 2 and job["summary"] == "Winter clothes"
+    assert job["transcript"] == "boots and scarves" and len(job["photos"]) == 2
+    photo = client.get(job["photos"][0])
+    assert photo.status_code == 200 and photo.headers["content-type"] == "image/jpeg"
+    assert wait_for(client, plain["id"])["status"] == "ready"
+    listed = client.get("/api/queue").json()["jobs"]
+    assert [j["id"] for j in listed] == [red["id"], plain["id"]]
+
+    # Check and save: goes to Homebox and leaves the queue.
+    r = client.post("/api/save", data={"box_number": "7", "colour": "Red", "queue_id": red["id"],
+                                       "items": json.dumps(job["draft"]["items"]), "transcript": job["transcript"]},
+                    files=[("photos", ("a.jpg", photo.content, "image/jpeg"))])
+    assert r.status_code == 200, r.text
+    assert r.json()["itemsSaved"] == 2
+    assert client.get(f"/api/queue/{red['id']}").status_code == 404
+    assert len(client.get("/api/box/7?colour=Red").json()["items"]) == 2
+
+    # A failure is kept and can be retried; delete removes it.
+    original = claude.items
+    claude.items = None  # makes the stand-in's reply invalid
+    try:
+        bad = client.post("/api/queue", data={"box_number": "9", "colour": "Red", "transcript": "x"}).json()
+        failed = wait_for(client, bad["id"])
+    finally:
+        claude.items = original
+    assert failed["status"] == "failed" and failed["error"]
+    assert client.post(f"/api/queue/{bad['id']}/retry").status_code == 200
+    assert wait_for(client, bad["id"])["status"] == "ready"
+    assert client.delete(f"/api/queue/{bad['id']}").status_code == 200
+    assert client.get(f"/api/queue/{bad['id']}").status_code == 404
+    assert client.get("/api/queue/not-a-job").status_code == 404

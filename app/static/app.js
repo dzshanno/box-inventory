@@ -14,6 +14,7 @@ const state = {
   boxInfo: null,    // response from /api/box
   photos: [],       // [{blob, url}]
   draft: null,      // response from /api/analyze
+  queueId: null,    // the saved-for-later box being checked, if any
 };
 const PHOTO_EDGE = 2000; // resize before upload: plenty for Homebox, much faster on mobile data
 
@@ -32,7 +33,7 @@ window.addEventListener("popstate", (e) => {
   // Don't step back into a half-finished save; go home instead.
   show(["stepReview", "stepCapture"].includes(step) && currentStep === "stepDone" ? "stepHome" : step, false);
 });
-function goHome() { stopMic(); if (state.labelling) setLabellingMode(false); show("stepHome"); }
+function goHome() { stopMic(); if (state.labelling) setLabellingMode(false); show("stepHome"); refreshQueueCount(); }
 function setMode(mode) {
   state.mode = mode;
   const alter = mode === "alter";
@@ -151,7 +152,8 @@ async function api(path, opts = {}) {
 function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ } }
 function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
 function forget(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
-const draftKey = () => `box-draft-${state.boxId || [state.colour, state.box].filter(Boolean).join("-") || "new-unlabelled"}`;
+const draftKey = () => state.queueId ? `box-draft-q-${state.queueId}`
+  : `box-draft-${state.boxId || [state.colour, state.box].filter(Boolean).join("-") || "new-unlabelled"}`;
 function saveDraft() {
   store(draftKey(), { transcript: $("transcript").value, items: state.draft ? collectItems() : null,
                       summary: state.draft?.box_summary || "" });
@@ -224,6 +226,7 @@ function startUnlabelled() {
 }
 
 function openBox(info) {
+  state.queueId = null;
   state.boxInfo = info;
   $("boxBadge").textContent = info.boxName;
   $("boxBadge").hidden = false;
@@ -535,6 +538,7 @@ async function save() {
   fd.append("items", JSON.stringify(items));
   fd.append("transcript", $("transcript").value.trim());
   fd.append("box_summary", state.draft?.box_summary || "");
+  if (state.queueId) fd.append("queue_id", state.queueId);
   state.photos.forEach((p, i) => fd.append("photos", p.blob, `photo-${i + 1}.jpg`));
   busy("Saving to Homebox…");
   let res;
@@ -550,6 +554,16 @@ async function save() {
   if (placeId) { state.placeId = placeId; store("last-place", placeId); learnPlace(placeId); }
   const link = $("doneLink");
   if (res.link) { link.href = res.link; link.hidden = false; } else link.hidden = true;
+  const fromQueue = !!state.queueId;
+  state.queueId = null;
+  $("doneQueue").hidden = true;
+  if (fromQueue) {
+    refreshQueueCount().then((jobs) => {
+      const left = (jobs || []).filter((x) => x.status !== "failed").length;
+      $("doneQueue").hidden = !left;
+      $("doneQueue").textContent = `Saved boxes (${left} left)`;
+    });
+  }
   show("stepDone");
 }
 
@@ -803,6 +817,130 @@ async function runClaudeSearch() {
   renderFind();
 }
 
+// ---------- save for later ----------
+async function queueBox() {
+  stopMic();
+  const transcript = $("transcript").value.trim();
+  if (!state.photos.length && !transcript) { toast("Add a photo or describe what's in the box."); return; }
+  const fd = new FormData();
+  addBoxFields(fd);
+  fd.append("location_id", state.placeId);
+  fd.append("transcript", transcript);
+  state.photos.forEach((p, i) => fd.append("photos", p.blob, `photo-${i + 1}.jpg`));
+  busy("Uploading…");
+  let job;
+  try { job = await api("/api/queue", { method: "POST", body: fd }); }
+  catch (e) { busy(); toast(e.message, true); return; }
+  if (state.queueId) { // re-saved after going back from checking it: this copy replaces the old one
+    try { await api(`/api/queue/${state.queueId}`, { method: "DELETE" }); } catch { /* already gone */ }
+  }
+  busy();
+  forget(draftKey());
+  clearPhotos();
+  $("transcript").value = "";
+  toast(`${job.boxName} saved for later. On to the next box.`);
+  refreshQueueCount();
+  startNextBox();
+}
+function startNextBox() {
+  state.queueId = null;
+  $("boxNumber").value = "";
+  if (state.box) $("boxHint").textContent = `Last box: ${[state.colour, state.box].filter(Boolean).join(" ")}`;
+  $("boxBadge").hidden = true; resetLabelResult(); show("stepBox");
+}
+const QUEUE_STATUS = {
+  waiting: "Waiting for Claude…",
+  working: "Claude is working on it…",
+};
+async function refreshQueueCount() {
+  let res;
+  try { res = await api("/api/queue"); } catch { return null; }
+  const jobs = res.jobs;
+  const ready = jobs.filter((j) => j.status === "ready").length;
+  const failed = jobs.filter((j) => j.status === "failed").length;
+  const busyCount = jobs.length - ready - failed;
+  $("goQueue").hidden = !jobs.length;
+  $("queueCount").textContent = [ready && `${ready} ready to check`, busyCount && `${busyCount} in progress`,
+    failed && `${failed} didn't work`].filter(Boolean).join(" · ");
+  return jobs;
+}
+let queueTimer;
+async function showQueue(push = true) {
+  clearTimeout(queueTimer);
+  const jobs = await refreshQueueCount();
+  if (jobs === null) { toast("Couldn't load the saved boxes.", true); return; }
+  const list = $("queueList");
+  list.innerHTML = jobs.length ? "" : '<p class="hint">Nothing saved for later.</p>';
+  for (const j of jobs) {
+    const div = document.createElement("div");
+    div.className = "ubox qbox";
+    div.innerHTML = `<img alt=""><div class="qbody"><h3></h3><p class="qstatus"></p><div class="row"></div></div>`;
+    if (j.thumb) div.querySelector("img").src = j.thumb; else div.querySelector("img").remove();
+    div.querySelector("h3").textContent = `${j.boxName} · ${j.place}`;
+    const st = div.querySelector(".qstatus");
+    st.classList.add(j.status);
+    st.textContent = j.status === "ready" ? `Ready to check: ${j.itemCount} item(s)${j.summary ? ` · ${j.summary}` : ""}`
+      : j.status === "failed" ? `Didn't work: ${j.error}` : QUEUE_STATUS[j.status] || j.status;
+    const row = div.querySelector(".row");
+    const button = (text, cls, fn) => {
+      const b = document.createElement("button"); b.type = "button"; b.className = cls; b.textContent = text;
+      b.onclick = fn; row.appendChild(b);
+    };
+    button("Delete", "secondary", () => deleteQueued(j));
+    if (j.status === "failed") button("Try again", "primary", () => retryQueued(j));
+    if (j.status === "ready") button("Check and save", "primary", () => openQueued(j.id));
+    list.appendChild(div);
+  }
+  if (push || currentStep !== "stepQueue") show("stepQueue", push);
+  // Keep the list fresh while Claude is still working through it.
+  if (jobs.some((j) => j.status === "waiting" || j.status === "working")) {
+    queueTimer = setTimeout(() => { if (currentStep === "stepQueue") showQueue(false); }, 5000);
+  }
+}
+async function deleteQueued(j) {
+  if (!confirm(`Delete the saved ${j.boxName}? Its photos and description will be lost.`)) return;
+  try { await api(`/api/queue/${j.id}`, { method: "DELETE" }); } catch (e) { toast(e.message, true); }
+  forget(`box-draft-q-${j.id}`);
+  showQueue(false);
+}
+async function retryQueued(j) {
+  try { await api(`/api/queue/${j.id}/retry`, { method: "POST" }); } catch (e) { toast(e.message, true); }
+  showQueue(false);
+}
+async function openQueued(id) {
+  clearTimeout(queueTimer);
+  busy("Loading…");
+  let job;
+  try {
+    job = await api(`/api/queue/${id}`);
+    if (!state.places.length) await loadPlaces();
+    clearPhotos();
+    for (const url of job.photos) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("Couldn't load a photo.");
+      const blob = await r.blob();
+      state.photos.push({ blob, url: URL.createObjectURL(blob) });
+    }
+  } catch (e) { busy(); toast(e.message, true); return; }
+  busy();
+  state.mode = "create";
+  state.box = job.boxNumber; state.colour = job.colour; state.boxId = job.boxId || null;
+  state.placeId = job.locationId;
+  state.boxInfo = null;
+  state.queueId = id;
+  renderPhotos();
+  $("existingNote").hidden = true;
+  $("transcript").value = job.transcript;
+  state.draft = job.draft;
+  const edits = load(draftKey());
+  if (edits?.items) state.draft = { ...job.draft, items: edits.items };
+  if (edits?.transcript) $("transcript").value = edits.transcript;
+  $("boxBadge").textContent = job.boxName;
+  $("boxBadge").hidden = false;
+  renderReview();
+  show("stepReview");
+}
+
 // ---------- wiring ----------
 $("startBtn").onclick = () => startBox($("boxNumber").value);
 $("labelPhoto").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) readLabel(f); };
@@ -864,11 +1002,11 @@ $("backToCapture").onclick = () => show("stepCapture");
 $("addItem").onclick = () => addItemCard({}).querySelector(".name").focus();
 $("saveBtn").onclick = save;
 // Boxes aren't done in number order, so the next box starts blank (photo the label or type it).
-$("nextBox").onclick = () => {
-  $("boxNumber").value = "";
-  if (state.box) $("boxHint").textContent = `Last box: ${[state.colour, state.box].filter(Boolean).join(" ")}`;
-  $("boxBadge").hidden = true; resetLabelResult(); show("stepBox");
-};
+$("nextBox").onclick = startNextBox;
+$("queueBtn").onclick = queueBox;
+$("goQueue").onclick = () => showQueue();
+$("queueHome").onclick = goHome;
+$("doneQueue").onclick = () => showQueue();
 $("sameBox").onclick = () => { state.mode = "create"; state.boxId ? startBoxById(state.boxId) : startBox(state.box); };
 
 (async function init() {
@@ -885,4 +1023,5 @@ $("sameBox").onclick = () => { state.mode = "create"; state.boxId ? startBoxById
     renderColours();
     state.defaultPlace = window.APP_CONFIG.defaultPlace;
   } catch (e) { toast(e.message, true); }
+  refreshQueueCount();
 })();

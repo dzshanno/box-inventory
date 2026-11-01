@@ -8,7 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN useradd --system --uid 10001 boxinv
+RUN useradd --system --uid 10001 boxinv && mkdir -p /srv/queue && chown boxinv /srv/queue
+# Boxes saved for later. Mount a volume here so they survive a container update.
+VOLUME /srv/queue
 USER boxinv
 
 EXPOSE 8080

@@ -26,6 +26,10 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>
       <span><strong>Change a box</strong><small>Add or edit items, or change its label</small></span>
     </button>
+    <button id="goQueue" class="home-card" type="button" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/><path d="m16 17 2 2 4-4"/></svg>
+      <span><strong>Saved for later</strong><small id="queueCount"></small></span>
+    </button>
     <button id="goFind" class="home-card" type="button">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
       <span><strong>Find something</strong><small>Search for an item or a box</small></span>
@@ -97,6 +101,14 @@
     <button id="viewBack" class="secondary" type="button">Back</button>
   </section>
 
+  <!-- Saved for later -->
+  <section id="stepQueue" class="step" hidden>
+    <h2 class="step-title">Saved for later</h2>
+    <p class="hint">Claude works through these one at a time. Check each list and save it to Homebox.</p>
+    <div id="queueList"></div>
+    <button id="queueHome" class="secondary" type="button">Back</button>
+  </section>
+
   <!-- Find -->
   <section id="stepFind" class="step" hidden>
     <h2 class="step-title">Find something</h2>
@@ -149,6 +161,9 @@
       <button id="backToBox" class="secondary" type="button">Back</button>
       <button id="analyseBtn" class="primary" type="button">Make inventory</button>
     </div>
+    <button id="queueBtn" class="secondary" type="button">Save for later</button>
+    <p class="hint">Save for later: Claude makes the list in the background while you do the next box.
+      Check it later from the home screen.</p>
   </section>
 
   <!-- 3. Review -->
@@ -170,6 +185,7 @@
     <h2 id="doneTitle">Saved</h2>
     <p id="doneText"></p>
     <p><a id="doneLink" target="_blank" rel="noopener" hidden>Open in Homebox</a></p>
+    <button id="doneQueue" class="primary" type="button" hidden>Check the next saved box</button>
     <button id="nextBox" class="primary" type="button">Next box</button>
     <button id="sameBox" class="secondary" type="button">Add more to this box</button>
     <button id="doneHome" class="link-btn" type="button">Home</button>

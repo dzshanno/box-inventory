@@ -66,6 +66,8 @@ class Settings:
 
     # Save the spoken description into the box's notes in Homebox.
     save_transcript: bool = field(default_factory=lambda: _bool("SAVE_TRANSCRIPT", True))
+    # Boxes saved for later (photos + description waiting for Claude, then for you to check).
+    queue_dir: str = field(default_factory=lambda: os.environ.get("QUEUE_DIR", "queue"))
 
     # Boxes without a label yet are called "Unlabelled 001", "Unlabelled 002"…
     unlabelled_prefix: str = field(default_factory=lambda: os.environ.get("UNLABELLED_NAME", "Unlabelled"))
