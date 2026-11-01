@@ -550,7 +550,6 @@ async function save() {
   if (placeId) { state.placeId = placeId; store("last-place", placeId); learnPlace(placeId); }
   const link = $("doneLink");
   if (res.link) { link.href = res.link; link.hidden = false; } else link.hidden = true;
-  $("nextBox").textContent = nextNumber() ? `Next box (${nextNumber()})` : "Next box";
   show("stepDone");
 }
 
@@ -805,9 +804,6 @@ async function runClaudeSearch() {
 }
 
 // ---------- wiring ----------
-function nextNumber() {
-  return /^\d+$/.test(state.box) ? String(parseInt(state.box, 10) + 1) : "";
-}
 $("startBtn").onclick = () => startBox($("boxNumber").value);
 $("labelPhoto").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) readLabel(f); };
 $("unlabelledBtn").onclick = startUnlabelled;
@@ -867,7 +863,12 @@ $("backToBox").onclick = () => { stopMic(); $("boxBadge").hidden = true; resetLa
 $("backToCapture").onclick = () => show("stepCapture");
 $("addItem").onclick = () => addItemCard({}).querySelector(".name").focus();
 $("saveBtn").onclick = save;
-$("nextBox").onclick = () => { $("boxNumber").value = nextNumber(); $("boxBadge").hidden = true; resetLabelResult(); show("stepBox"); };
+// Boxes aren't done in number order, so the next box starts blank (photo the label or type it).
+$("nextBox").onclick = () => {
+  $("boxNumber").value = "";
+  if (state.box) $("boxHint").textContent = `Last box: ${[state.colour, state.box].filter(Boolean).join(" ")}`;
+  $("boxBadge").hidden = true; resetLabelResult(); show("stepBox");
+};
 $("sameBox").onclick = () => { state.mode = "create"; state.boxId ? startBoxById(state.boxId) : startBox(state.box); };
 
 (async function init() {
